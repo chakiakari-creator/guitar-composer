@@ -200,9 +200,9 @@ function buildLogicProPerfectSMF(events: MidiEvent[], bpm: number): Uint8Array {
   };
 
   const headerChunk = [
-    0x4d, 0x74, 0x68, 0x64, // MThd
+    0x4d, 0x54, 0x68, 0x64, // "MThd" (chunk type is case-sensitive; a stray 0x74 here breaks every strict parser)
     0x00, 0x00, 0x00, 0x06, // Length 6
-    0x00, 0x01,             // Type 1
+    0x00, 0x01,             // Format 1
     0x00, 0x03,             // 3 Tracks (Meta, Guitar, Melody)
     (ticksPerBeat >> 8) & 0xff, ticksPerBeat & 0xff
   ];
@@ -599,7 +599,8 @@ export default function GuitarComposer() {
     }
 
     const smfArray = buildLogicProPerfectSMF(recordedEvents, bpm);
-    const blob = new Blob([smfArray.buffer], { type: "application/octet-stream" });
+    const arrayBuffer = smfArray.buffer.slice(smfArray.byteOffset, smfArray.byteOffset + smfArray.byteLength) as ArrayBuffer;
+    const blob = new Blob([arrayBuffer], { type: "application/octet-stream" });
     const url = URL.createObjectURL(blob);
 
     const a = document.createElement("a");
