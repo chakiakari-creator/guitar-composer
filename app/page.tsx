@@ -236,6 +236,8 @@ export default function GuitarComposer() {
 
   // 録音 & MIDI状態
   const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [isCountingIn, setIsCountingIn] = useState<boolean>(false);
+  const [countInBeatsLeft, setCountInBeatsLeft] = useState<number>(4);
   const [recordedEvents, setRecordedEvents] = useState<MidiEvent[]>([]);
   const totalTickCounterRef = useRef<number>(0);
 
@@ -251,7 +253,8 @@ export default function GuitarComposer() {
   // スケジューラー参照
   const isPlayingRef = useRef(false);
   const isRecordingRef = useRef(false);
-  const shouldStartRecordingRef = useRef(false);
+  const isCountingInRef = useRef(false);
+  const countInRemainingStepsRef = useRef(0);
   const bpmRef = useRef(bpm);
   const keyOffsetRef = useRef(keyOffset);
   const selectedPatternIdRef = useRef(selectedPatternId);
@@ -424,6 +427,27 @@ export default function GuitarComposer() {
     [ensureAudioContext]
   );
 
+  // 4カウントの「カチ」音。MIDIには記録しない（あくまでプレイヤー向けのガイド音）。
+  const playCountInClick = useCallback(
+    (time: number, isFirstBeat: boolean) => {
+      const ctx = ensureAudioContext();
+      const osc = ctx.createOscillator();
+      osc.type = "square";
+      osc.frequency.setValueAtTime(isFirstBeat ? 1760 : 1320, time);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, time);
+      g.gain.linearRampToValueAtTime(isFirstBeat ? 0.28 : 0.18, time + 0.003);
+      g.gain.exponentialRampToValueAtTime(0.0001, time + 0.06);
+
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start(time);
+      osc.stop(time + 0.08);
+    },
+    [ensureAudioContext]
+  );
+
   const generateRandomMelodyPattern = () => {
     const mask: boolean[] = [];
     const probability = noteDensity / 100;
@@ -557,11 +581,32 @@ export default function GuitarComposer() {
     const lookahead = 0.1;
 
     while (nextNoteTimeRef.current < ctx.currentTime + lookahead) {
-      // 4拍（96 ticks）待ってから、設定されていれば記録を開始
-      if (shouldStartRecordingRef.current && totalTickCounterRef.current >= 96 && !isRecordingRef.current) {
-        isRecordingRef.current = true;
-        setIsRecording(true);
+      // カウントイン中は無音で4拍分だけ進め、コード/メロディは一切鳴らさない・録音もしない
+      if (isCountingInRef.current) {
+        const remaining = countInRemainingStepsRef.current;
+        if (remaining % 4 === 0) {
+          const beatsLeft = remaining / 4;
+          setCountInBeatsLeft(beatsLeft);
+          playCountInClick(nextNoteTimeRef.current, beatsLeft === 4);
+        }
+
+        const secondsPerBeatCountIn = 60.0 / bpmRef.current;
+        const secondsPer16thCountIn = secondsPerBeatCountIn / 4.0;
+        nextNoteTimeRef.current += secondsPer16thCountIn;
+        countInRemainingStepsRef.current -= 1;
+
+        if (countInRemainingStepsRef.current <= 0) {
+          isCountingInRef.current = false;
+          setIsCountingIn(false);
+          isRecordingRef.current = true;
+          setIsRecording(true);
+          currentStepRef.current = 0;
+          currentBarRef.current = 0;
+          totalTickCounterRef.current = 0;
+        }
+        continue;
       }
+
       const strokePattern = STROKE_PATTERNS.find((p) => p.id === selectedPatternIdRef.current)!;
       const melodyPattern = melodyPatternsRef.current.find((p) => p.id === selectedMelodyPatternIdRef.current) || melodyPatternsRef.current[0];
 
@@ -602,16 +647,26 @@ export default function GuitarComposer() {
     if (isPlayingRef.current) {
       timerIdRef.current = window.setTimeout(scheduler, 25);
     }
-  }, [ensureAudioContext, scheduleStroke, getAutoMelodyFreqAndNote, playMelodyScheduled]);
+  }, [ensureAudioContext, scheduleStroke, getAutoMelodyFreqAndNote, playMelodyScheduled, playCountInClick]);
+
+  // 再生・カウントイン・録音をすべて止めて無音の状態に戻す
+  const stopAll = useCallback(() => {
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+    isCountingInRef.current = false;
+    setIsCountingIn(false);
+    isRecordingRef.current = false;
+    setIsRecording(false);
+    if (timerIdRef.current) {
+      clearTimeout(timerIdRef.current);
+      timerIdRef.current = null;
+    }
+    setCurrentStep(-1);
+  }, []);
 
   const togglePlay = () => {
     if (isPlaying) {
-      isPlayingRef.current = false;
-      setIsPlaying(false);
-      if (timerIdRef.current) clearTimeout(timerIdRef.current);
-      setCurrentStep(-1);
-      isRecordingRef.current = false;
-      setIsRecording(false);
+      stopAll();
       return;
     }
 
@@ -628,23 +683,49 @@ export default function GuitarComposer() {
       currentBarRef.current = 0;
       totalTickCounterRef.current = 0;
       nextNoteTimeRef.current = ctx.currentTime + 0.05;
-      shouldStartRecordingRef.current = isRecording;
-      if (isRecording) {
-        isRecordingRef.current = false;
-      }
+      scheduler();
+    });
+  };
+
+  // 「録音開始」: 再生中なら一旦音を止め、4カウント（無音＋クリック音）を置いてから
+  // 設定したコード進行の1つ目（小節1・ステップ0）から録音つきで再生を始める。
+  const startRecordingFlow = () => {
+    // すでに何か鳴っていれば即座に止める
+    isPlayingRef.current = false;
+    isCountingInRef.current = false;
+    isRecordingRef.current = false;
+    if (timerIdRef.current) {
+      clearTimeout(timerIdRef.current);
+      timerIdRef.current = null;
+    }
+    setIsRecording(false);
+    setIsCountingIn(false);
+    setCurrentStep(-1);
+    setRecordedEvents([]);
+
+    isPlayingRef.current = true;
+    setIsPlaying(true);
+
+    resumeAudioContext().then((ctx) => {
+      if (!isPlayingRef.current) return;
+
+      currentStepRef.current = 0;
+      currentBarRef.current = 0;
+      totalTickCounterRef.current = 0;
+      countInRemainingStepsRef.current = 16; // 4拍分 = 16分音符16ステップ
+      setCountInBeatsLeft(4);
+      isCountingInRef.current = true;
+      setIsCountingIn(true);
+      nextNoteTimeRef.current = ctx.currentTime + 0.05;
       scheduler();
     });
   };
 
   const toggleRecording = () => {
-    if (isRecording) {
-      setIsRecording(false);
-      isRecordingRef.current = false;
+    if (isRecording || isCountingIn) {
+      stopAll();
     } else {
-      setRecordedEvents([]);
-      setIsRecording(true);
-      isRecordingRef.current = true;
-      if (!isPlaying) togglePlay();
+      startRecordingFlow();
     }
   };
 
@@ -684,20 +765,20 @@ export default function GuitarComposer() {
   const hasAnyFilterOn = allowPassingTones || allowOnlyShortNotes;
 
   return (
-    <div className="min-h-screen bg-stone-950 text-stone-100 p-4 sm:p-6 flex flex-col items-center select-none">
-      <div className="w-full max-w-4xl space-y-6">
-        {/* ヘッダー */}
-        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 border-b border-stone-800 pb-4">
+    <div className="min-h-screen bg-stone-950 text-stone-100 select-none">
+      {/* 常に画面上部に固定される操作バー */}
+      <div className="sticky top-0 z-30 bg-stone-950/95 backdrop-blur border-b border-stone-800 px-4 sm:px-6 py-3">
+        <div className="w-full max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <Music className="w-6 h-6 text-amber-400" />
-            <h1 className="text-xl font-bold tracking-wide">ギター作曲アシスタント</h1>
+            <Music className="w-6 h-6 text-amber-400 shrink-0" />
+            <h1 className="text-lg sm:text-xl font-bold tracking-wide">ギター作曲アシスタント</h1>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-center">
             {/* 再生/停止ボタン */}
             <button
               onClick={togglePlay}
-              className={`flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold transition-colors shadow-lg ${
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold transition-colors shadow-lg ${
                 isPlaying
                   ? "bg-rose-500 hover:bg-rose-400 text-white"
                   : "bg-amber-500 hover:bg-amber-400 text-stone-950"
@@ -711,13 +792,46 @@ export default function GuitarComposer() {
               ) : (
                 <>
                   <Play className="w-5 h-5 fill-current" />
-                  <span>コード＆メロディ再生</span>
+                  <span>再生</span>
                 </>
               )}
             </button>
+
+            {/* 録音ボタン */}
+            <button
+              onClick={toggleRecording}
+              className={`flex items-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs transition-all shadow-md ${
+                isRecording
+                  ? "bg-rose-600 text-white animate-pulse shadow-rose-900/50"
+                  : isCountingIn
+                  ? "bg-amber-600 text-white animate-pulse shadow-amber-900/50"
+                  : "bg-stone-800 border border-stone-700 text-rose-400 hover:bg-stone-700"
+              }`}
+            >
+              <Disc className="w-4 h-4" />
+              <span>
+                {isRecording
+                  ? "録音中 (停止)"
+                  : isCountingIn
+                  ? `カウント中… ${countInBeatsLeft}`
+                  : "録音開始"}
+              </span>
+            </button>
+
+            {/* MIDIダウンロードボタン */}
+            <button
+              onClick={downloadMidiFile}
+              disabled={recordedEvents.length === 0}
+              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs border border-emerald-500/50 text-emerald-300 bg-emerald-950/30 hover:bg-emerald-900/50 disabled:opacity-40 disabled:border-stone-800 transition-all shadow-md"
+            >
+              <Download className="w-4 h-4" />
+              <span>MIDI出力</span>
+            </button>
           </div>
         </div>
+      </div>
 
+      <div className="w-full max-w-4xl mx-auto p-4 sm:p-6 space-y-6">
         {/* コントロールパネル */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-stone-900 border border-stone-800 p-4 rounded-2xl">
           <div className="flex items-center gap-4">
@@ -1002,39 +1116,13 @@ export default function GuitarComposer() {
               </div>
             </div>
 
-            <div className="flex flex-col gap-6 justify-between items-center sm:items-stretch">
+            <div className="flex flex-col gap-6 justify-center items-center sm:items-stretch">
               <div className="text-xs text-stone-300 space-y-2 text-center sm:text-left">
                 <div className="font-bold text-emerald-400 text-sm">操作ガイド</div>
                 <p className="text-[11px] text-stone-400 leading-relaxed">
-                  ・「録音開始」を押してから再生開始します。<br />
-                  ・再生開始から4カウント待ってから自動的に記録が始まります。<br />
-                  ・「MIDI出力」で.midファイルをダウンロード。
+                  ・画面上部の「録音開始」を押すと、今鳴っている音は一旦止まり、4カウント（クリック音）の後に小節1・1つ目のコードから録音つきで再生が始まります。<br />
+                  ・録音・再生・MIDI出力ボタンは画面をスクロールしても常に上部に表示されています。
                 </p>
-              </div>
-
-              <div className="flex flex-col gap-2 w-full sm:w-auto">
-                {/* 録音ボタン */}
-                <button
-                  onClick={toggleRecording}
-                  className={`flex items-center justify-center gap-1.5 px-4 py-3 rounded-xl font-bold text-xs transition-all shadow-md ${
-                    isRecording
-                      ? "bg-rose-600 text-white animate-pulse shadow-rose-900/50"
-                      : "bg-stone-800 border border-stone-700 text-rose-400 hover:bg-stone-700"
-                  }`}
-                >
-                  <Disc className="w-4 h-4" />
-                  <span>{isRecording ? "録音中 (停止)" : "録音開始"}</span>
-                </button>
-
-                {/* MIDIダウンロードボタン */}
-                <button
-                  onClick={downloadMidiFile}
-                  disabled={recordedEvents.length === 0}
-                  className="flex items-center justify-center gap-1.5 px-4 py-3 rounded-xl font-bold text-xs border border-emerald-500/50 text-emerald-300 bg-emerald-950/30 hover:bg-emerald-900/50 disabled:opacity-40 disabled:border-stone-800 transition-all shadow-md"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>MIDI出力</span>
-                </button>
               </div>
             </div>
           </div>
