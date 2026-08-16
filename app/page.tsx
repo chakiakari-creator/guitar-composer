@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
-import { Play, Square, Music, Sliders, Repeat, Sparkles, Shuffle, ShieldCheck, Disc, Download } from "lucide-react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { Play, Square, Music, Sliders, Repeat, Sparkles, Shuffle, ShieldCheck, Disc, Download, HelpCircle, X, Sparkle, Music2, Music4, Cloud, CloudUpload, FolderOpen, Trash2, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
+import { supabase, type CloudPreset, type NewCloudPreset } from "@/lib/supabase";
 
 // ============================================================
 // 音楽理論 & 定義
@@ -9,26 +10,434 @@ import { Play, Square, Music, Sliders, Repeat, Sparkles, Shuffle, ShieldCheck, D
 const OPEN_STRINGS_FREQ = [82.41, 110.0, 146.83, 196.0, 246.94, 329.63];
 const C_MAJOR_SCALE = [0, 2, 4, 5, 7, 9, 11];
 
+// 機能和声: Tonic(安定) / Subdominant(展開) / Dominant(進行力・解決欲求)
+// マイナーキーでは Tm(トニックマイナー) / SDm(サブドミナントマイナー) を使用。Dは長短で共通。
+type HarmonicFunction = "T" | "SD" | "D" | "Tm" | "SDm";
+
+// 度数（ローマ数字）表記。カデンツ判定にはT/SD/Dだけでなく、この精度が必要
+// （例: 全終止はT一般ではなく「I」着地、偽終止は「VIm」着地でなければならない）
+type ChordDegree =
+  // メジャーキー
+  | "I" | "IIm" | "IIIm" | "IV" | "V" | "VIm" | "VIIb5" | "secDom"
+  // マイナーキー（Key Am基準）
+  | "Im" | "bIII" | "IVm" | "IIm7b5" | "bVI" | "IV7" | "V7" | "Vm7" | "bVII" | "bVII7" | "VIIm7b5";
+
+type KeyMode = "major" | "minor";
+
 interface ChordVoicing {
   name: string;
-  frets: number[];
-  chordTones: number[];
+  frets: number[]; // 6弦分。-1 = ミュート。E-A-D-G-B-E の順（OPEN_STRINGS_FREQ / baseMidi と対応）
+  chordTones: number[]; // ルートからの音程クラス(0-11)。スラッシュコードは分子側のトライアドで代表する
+  function: HarmonicFunction;
+  degree: ChordDegree;
 }
 
-const DIATONIC_CHORDS: ChordVoicing[] = [
-  { name: "C", frets: [-1, 3, 2, 0, 1, 0], chordTones: [0, 4, 7, 11] },
-  { name: "Dm", frets: [-1, -1, 0, 2, 3, 1], chordTones: [2, 5, 9, 0] },
-  { name: "Em", frets: [0, 2, 2, 0, 0, 0], chordTones: [4, 7, 11, 2] },
-  { name: "F", frets: [1, 3, 3, 2, 1, 1], chordTones: [5, 9, 0, 4] },
-  { name: "G", frets: [3, 2, 0, 0, 0, 3], chordTones: [7, 11, 2, 5] },
-  { name: "Am", frets: [-1, 0, 2, 2, 1, 0], chordTones: [9, 0, 4, 7] },
-  { name: "Bdim", frets: [-1, 2, 3, 2, 3, -1], chordTones: [11, 2, 5, 9] },
+// Key C 基準・ギターで弾きやすいオープン/ローポジション優先のボイシング集
+const CHORD_LIBRARY: ChordVoicing[] = [
+  // --- ダイアトニック・トライアド ---
+  { name: "C", frets: [-1, 3, 2, 0, 1, 0], chordTones: [0, 4, 7], function: "T", degree: "I" },
+  { name: "Dm", frets: [-1, -1, 0, 2, 3, 1], chordTones: [2, 5, 9], function: "SD", degree: "IIm" },
+  { name: "Em", frets: [0, 2, 2, 0, 0, 0], chordTones: [4, 7, 11], function: "T", degree: "IIIm" },
+  { name: "F", frets: [1, 3, 3, 2, 1, 1], chordTones: [5, 9, 0], function: "SD", degree: "IV" },
+  { name: "G", frets: [3, 2, 0, 0, 0, 3], chordTones: [7, 11, 2], function: "D", degree: "V" },
+  { name: "Am", frets: [-1, 0, 2, 2, 1, 0], chordTones: [9, 0, 4], function: "T", degree: "VIm" },
+  // Bm7(b5) = vii半減7。この開放形フォームは実際には4声(B,D,F,A)を鳴らすハーフディミニッシュ7th
+  { name: "Bm7b5", frets: [-1, 2, 3, 2, 3, -1], chordTones: [11, 2, 5, 9], function: "D", degree: "VIIb5" },
+
+  // --- メジャー7th / マイナー7th ---
+  { name: "Cmaj7", frets: [-1, 3, 2, 0, 0, 0], chordTones: [0, 4, 7, 11], function: "T", degree: "I" },
+  { name: "Fmaj7", frets: [-1, -1, 3, 2, 1, 0], chordTones: [5, 9, 0, 4], function: "SD", degree: "IV" },
+  { name: "Dm7", frets: [-1, -1, 0, 2, 1, 1], chordTones: [2, 5, 9, 0], function: "SD", degree: "IIm" },
+  { name: "Em7", frets: [0, 2, 0, 0, 0, 0], chordTones: [4, 7, 11, 2], function: "T", degree: "IIIm" },
+  { name: "Am7", frets: [-1, 0, 2, 0, 1, 0], chordTones: [9, 0, 4, 7], function: "T", degree: "VIm" },
+
+  // --- ドミナント7th（セカンダリードミナント含む） ---
+  { name: "G7", frets: [3, 2, 0, 0, 0, 1], chordTones: [7, 11, 2, 5], function: "D", degree: "V" },
+  { name: "E7", frets: [0, 2, 0, 1, 0, 0], chordTones: [4, 8, 11, 2], function: "D", degree: "secDom" }, // V7/VIm
+  { name: "A7", frets: [-1, 0, 2, 0, 2, 0], chordTones: [9, 1, 4, 7], function: "D", degree: "secDom" }, // V7/IIm
+
+  // --- sus4 / add9 ---
+  { name: "Csus4", frets: [-1, 3, 3, 0, 1, 1], chordTones: [0, 5, 7], function: "T", degree: "I" },
+  { name: "Gsus4", frets: [3, 3, 0, 0, 1, 3], chordTones: [7, 0, 2], function: "D", degree: "V" },
+  { name: "Cadd9", frets: [-1, 3, 2, 0, 3, 0], chordTones: [0, 4, 7, 2], function: "T", degree: "I" },
+  { name: "Fadd9", frets: [-1, -1, 3, 2, 1, 3], chordTones: [5, 9, 0, 7], function: "SD", degree: "IV" },
+
+  // --- 分数コード / オンベース（響きは分子側のトライアド） ---
+  { name: "G/B", frets: [-1, 2, 0, 0, 0, 3], chordTones: [7, 11, 2], function: "D", degree: "V" },
+  { name: "F/A", frets: [-1, 0, 3, 2, 1, 1], chordTones: [5, 9, 0], function: "SD", degree: "IV" },
+  { name: "C/E", frets: [0, 3, 2, 0, 1, 0], chordTones: [0, 4, 7], function: "T", degree: "I" },
 ];
 
+// Key Am 基準・自然/和声/旋律短音階から実用的に選んだマイナーダイアトニック・ボイシング集。
+// Am,C,Dm,Em,F,G,G7,Em7,Dm7,Cmaj7,Fmaj7,Am7,Bm7b5 は長調ライブラリと同じ響き（同じ弦・フレット）を
+// 短調の文脈で再解釈しているだけなので、実体（frets/chordTones）を再利用している。
+const MINOR_CHORD_LIBRARY: ChordVoicing[] = [
+  // --- Tm: トニックマイナー ---
+  { name: "Am", frets: [-1, 0, 2, 2, 1, 0], chordTones: [9, 0, 4], function: "Tm", degree: "Im" },
+  { name: "Am7", frets: [-1, 0, 2, 0, 1, 0], chordTones: [9, 0, 4, 7], function: "Tm", degree: "Im" },
+  { name: "C", frets: [-1, 3, 2, 0, 1, 0], chordTones: [0, 4, 7], function: "Tm", degree: "bIII" },
+  { name: "Cmaj7", frets: [-1, 3, 2, 0, 0, 0], chordTones: [0, 4, 7, 11], function: "Tm", degree: "bIII" },
+
+  // --- SDm: サブドミナントマイナー ---
+  { name: "Dm", frets: [-1, -1, 0, 2, 3, 1], chordTones: [2, 5, 9], function: "SDm", degree: "IVm" },
+  { name: "Dm7", frets: [-1, -1, 0, 2, 1, 1], chordTones: [2, 5, 9, 0], function: "SDm", degree: "IVm" },
+  { name: "Bm7b5", frets: [-1, 2, 3, 2, 3, -1], chordTones: [11, 2, 5, 9], function: "SDm", degree: "IIm7b5" },
+  { name: "F", frets: [1, 3, 3, 2, 1, 1], chordTones: [5, 9, 0], function: "SDm", degree: "bVI" },
+  { name: "Fmaj7", frets: [-1, -1, 3, 2, 1, 0], chordTones: [5, 9, 0, 4], function: "SDm", degree: "bVI" },
+  // IV7 (D7): サブドミナントマイナーの代理としてよく使われるモーダル・ドミナント
+  { name: "D7", frets: [-1, -1, 0, 2, 1, 2], chordTones: [2, 6, 9, 0], function: "SDm", degree: "IV7" },
+
+  // --- D: ドミナント（長調と共通の機能） ---
+  { name: "E7", frets: [0, 2, 0, 1, 0, 0], chordTones: [4, 8, 11, 2], function: "D", degree: "V7" }, // 和声短音階由来
+  { name: "Em7", frets: [0, 2, 0, 0, 0, 0], chordTones: [4, 7, 11, 2], function: "D", degree: "Vm7" }, // 自然短音階由来
+  { name: "G", frets: [3, 2, 0, 0, 0, 3], chordTones: [7, 11, 2], function: "D", degree: "bVII" },
+  { name: "G7", frets: [3, 2, 0, 0, 0, 1], chordTones: [7, 11, 2, 5], function: "D", degree: "bVII7" },
+  // VIIm7b5 (G#m7b5): 和声短音階の導音上に built られるハーフディミニッシュ（新規ボイシング）
+  { name: "G#m7b5", frets: [4, 2, 0, -1, -1, 2], chordTones: [8, 11, 2, 6], function: "D", degree: "VIIm7b5" },
+];
+
+function getChordLibraryForMode(mode: KeyMode): ChordVoicing[] {
+  return mode === "major" ? CHORD_LIBRARY : MINOR_CHORD_LIBRARY;
+}
+
+// "D"（ドミナント）は長調・短調で実体の異なるコード集合を指すため、必ずモード込みで取得する
+// （固定の辞書にすると"D"キーが長調/短調どちらかでしか正しくならず衝突するため関数化）
+function getChordsByFunctionGroup(mode: KeyMode, fn: HarmonicFunction): ChordVoicing[] {
+  return getChordLibraryForMode(mode).filter((c) => c.function === fn);
+}
+
+function getFunctionGroupsForMode(mode: KeyMode): HarmonicFunction[] {
+  return mode === "major" ? ["T", "SD", "D"] : ["Tm", "SDm", "D"];
+}
+
+const FUNCTION_LABELS: Record<HarmonicFunction, string> = {
+  T: "Tonic（安定）",
+  SD: "Subdominant（展開）",
+  D: "Dominant（進行力・解決）",
+  Tm: "Tonic minor（トニックマイナー）",
+  SDm: "Subdominant minor（サブドミナントマイナー）",
+};
+
+const FUNCTION_SHORT_LABELS: Record<HarmonicFunction, string> = { T: "T", SD: "SD", D: "D", Tm: "Tm", SDm: "SDm" };
+
+// 機能和声の配色: T=青系(安定) / SD=黄緑系(展開) / D=オレンジ系(進行力・緊張)
+// マイナー: Tm=濃紺(indigo) / SDm=深緑・ティール(teal) / D はメジャーと共通のオレンジ
+const FUNCTION_BADGE_STYLES: Record<HarmonicFunction, { badge: string; dot: string; border: string; ring: string }> = {
+  T: { badge: "bg-sky-500/20 text-sky-300 border-sky-400/50", dot: "bg-sky-400", border: "border-sky-500/60", ring: "ring-sky-400" },
+  SD: { badge: "bg-lime-500/20 text-lime-300 border-lime-400/50", dot: "bg-lime-400", border: "border-lime-500/60", ring: "ring-lime-400" },
+  D: { badge: "bg-orange-500/20 text-orange-300 border-orange-400/50", dot: "bg-orange-400", border: "border-orange-500/60", ring: "ring-orange-400" },
+  Tm: { badge: "bg-indigo-500/20 text-indigo-300 border-indigo-400/50", dot: "bg-indigo-400", border: "border-indigo-500/60", ring: "ring-indigo-400" },
+  SDm: { badge: "bg-teal-500/20 text-teal-300 border-teal-400/50", dot: "bg-teal-400", border: "border-teal-500/60", ring: "ring-teal-400" },
+};
+
+// 6弦の開放弦MIDIノート番号（E2,A2,D3,G3,B3,E4 = 標準チューニング）
+const OPEN_STRING_MIDI = [40, 45, 50, 55, 59, 64];
+
+// ボイシング中でミュートされていない最低音（ベース音）のMIDIノート番号を返す
+function getChordBassMidiNote(chord: ChordVoicing): number {
+  let bass = Infinity;
+  chord.frets.forEach((fret, i) => {
+    if (fret !== -1) {
+      const note = OPEN_STRING_MIDI[i] + fret;
+      if (note < bass) bass = note;
+    }
+  });
+  return bass === Infinity ? 0 : bass;
+}
+
+// ============================================================
+// カデンツ（Cadence）理論エンジン — メジャーキー
+// ============================================================
+const TONIC_DEGREES: ChordDegree[] = ["I", "VIm", "IIIm"];
+const SUB_DEGREES: ChordDegree[] = ["IV", "IIm"];
+const DOMINANT_GENERAL_DEGREES: ChordDegree[] = ["V", "VIIb5", "secDom"]; // 経過的なD（厳密な解決を要さない箇所）
+const DOMINANT_RESOLVING_DEGREES: ChordDegree[] = ["V", "VIIb5"]; // カデンツ直前の「本当に解決するD」
+
+function pickByDegreeFrom(library: ChordVoicing[], degrees: ChordDegree[], excludeName?: string): ChordVoicing {
+  const pool = library.filter((c) => degrees.includes(c.degree));
+  const candidates = excludeName ? pool.filter((c) => c.name !== excludeName) : pool;
+  const list = candidates.length > 0 ? candidates : pool;
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+function pickByDegree(degrees: ChordDegree[], excludeName?: string): ChordVoicing {
+  return pickByDegreeFrom(CHORD_LIBRARY, degrees, excludeName);
+}
+
+type CadenceEndingId = "perfect" | "deceptive" | "half" | "plagal";
+type CadenceSkeletonId = "cadence1" | "cadence2" | "cadence3";
+type CadenceMood = "auto" | "twoFiveOne" | "dominantResolve" | "gentleAmen" | "deceptive";
+
+const CADENCE_ENDING_LABELS: Record<CadenceEndingId, string> = {
+  perfect: "全終止 (Perfect Cadence)",
+  deceptive: "偽終止 (Deceptive Cadence)",
+  half: "半終止 (Half Cadence)",
+  plagal: "変終止 (Plagal / アーメン終止)",
+};
+
+const CADENCE_SKELETON_LABELS: Record<CadenceSkeletonId, string> = {
+  cadence1: "カデンツ1：T → D → T",
+  cadence2: "カデンツ2：T → S → D → T",
+  cadence3: "カデンツ3：T → S → T",
+};
+
+const CADENCE_MOOD_OPTIONS: { id: CadenceMood; label: string }[] = [
+  { id: "auto", label: "🎲 おまかせカデンツ生成" },
+  { id: "twoFiveOne", label: "⚡ 王道ツーファイブ (T-S-D-T)" },
+  { id: "dominantResolve", label: "🔥 ドミナント解決 (T-D-T)" },
+  { id: "gentleAmen", label: "🍃 穏やかアーメン (T-S-T)" },
+  { id: "deceptive", label: "💫 切ない偽終止 (D→VIm)" },
+];
+
+interface CadenceResult {
+  kind: "major";
+  chords: string[];
+  beats: BlockBeats[];
+  skeletonId: CadenceSkeletonId;
+  skeletonLabel: string;
+  endingId: CadenceEndingId;
+  endingLabel: string;
+}
+
+// カデンツ1 (T → D → T): [T] → [TまたはD] → [D] → [T]
+function buildCadence1(): { bars: ChordVoicing[]; endingId: CadenceEndingId } {
+  const bar1 = pickByDegree(TONIC_DEGREES);
+  const bar2 =
+    Math.random() < 0.5
+      ? pickByDegree(TONIC_DEGREES, bar1.name)
+      : pickByDegree(DOMINANT_GENERAL_DEGREES, bar1.name);
+  const bar3 = pickByDegree(DOMINANT_RESOLVING_DEGREES, bar2.name);
+
+  const canDeceptive = bar3.degree === "V";
+  const endingId: CadenceEndingId = canDeceptive && Math.random() < 0.3 ? "deceptive" : "perfect";
+  const bar4 = endingId === "deceptive" ? pickByDegree(["VIm"], bar3.name) : pickByDegree(["I"], bar3.name);
+
+  return { bars: [bar1, bar2, bar3, bar4], endingId };
+}
+
+// カデンツ2 (T → S → D → T)：王道ツーファイブワンを含む本命パターン
+function buildCadence2(forcedEnding?: CadenceEndingId): { bars: ChordVoicing[]; endingId: CadenceEndingId } {
+  const bar1 = pickByDegree(TONIC_DEGREES);
+  const bar2 = pickByDegree(SUB_DEGREES, bar1.name);
+  // 偽終止(D7→VIm)は理論上V7(=G系)からでないと成立しないため、その場合はVIIb5を除外する
+  const bar3Degrees: ChordDegree[] = forcedEnding === "deceptive" ? ["V"] : DOMINANT_RESOLVING_DEGREES;
+  const bar3 = pickByDegree(bar3Degrees, bar2.name);
+
+  let endingId = forcedEnding;
+  if (!endingId) {
+    const canDeceptive = bar3.degree === "V";
+    endingId = canDeceptive && Math.random() < 0.25 ? "deceptive" : "perfect";
+  }
+  const bar4 = endingId === "deceptive" ? pickByDegree(["VIm"], bar3.name) : pickByDegree(["I"], bar3.name);
+
+  return { bars: [bar1, bar2, bar3, bar4], endingId };
+}
+
+// カデンツ3 (T → S → T)：変終止（アーメン終止）中心の穏やかな進行
+function buildCadence3(forcePlagal: boolean): { bars: ChordVoicing[]; endingId: CadenceEndingId } {
+  const bar1 = pickByDegree(TONIC_DEGREES);
+  const bar2 = pickByDegree(SUB_DEGREES, bar1.name);
+  const bar3IsSub = forcePlagal ? true : Math.random() < 0.6;
+  const bar3 = bar3IsSub ? pickByDegree(SUB_DEGREES, bar2.name) : pickByDegree(TONIC_DEGREES, bar2.name);
+  const bar4 = pickByDegree(["I"], bar3.name);
+
+  const endingId: CadenceEndingId = bar3IsSub ? "plagal" : "perfect";
+  return { bars: [bar1, bar2, bar3, bar4], endingId };
+}
+
+// 半終止（Half Cadence）へ上書き: 4小節目をドミナントで終わらせ、次のループへの一息を作る
+function applyHalfCadenceOverride(bars: ChordVoicing[]): ChordVoicing[] {
+  const bar3 = bars[2];
+  const bar4 = pickByDegree(["V"], bar3.name);
+  return [bars[0], bars[1], bars[2], bar4];
+}
+
+// カデンツ（終止形）理論に基づく本格的な4小節進行生成
+function generateCadenceProgression(mood: CadenceMood): CadenceResult {
+  let skeletonId: CadenceSkeletonId;
+  let result: { bars: ChordVoicing[]; endingId: CadenceEndingId };
+
+  switch (mood) {
+    case "twoFiveOne":
+      skeletonId = "cadence2";
+      result = buildCadence2("perfect");
+      break;
+    case "dominantResolve":
+      skeletonId = "cadence1";
+      result = buildCadence1();
+      break;
+    case "gentleAmen":
+      skeletonId = "cadence3";
+      result = buildCadence3(true);
+      break;
+    case "deceptive":
+      skeletonId = "cadence2";
+      result = buildCadence2("deceptive");
+      break;
+    case "auto":
+    default: {
+      const roll = Math.random();
+      if (roll < 0.34) {
+        skeletonId = "cadence1";
+        result = buildCadence1();
+      } else if (roll < 0.72) {
+        skeletonId = "cadence2";
+        result = buildCadence2();
+      } else {
+        skeletonId = "cadence3";
+        result = buildCadence3(false);
+      }
+      // おまかせ時のみ、15%の確率で半終止（ループを促す一息）に差し替える
+      if (Math.random() < 0.15) {
+        result = { bars: applyHalfCadenceOverride(result.bars), endingId: "half" };
+      }
+      break;
+    }
+  }
+
+  return {
+    kind: "major",
+    chords: result.bars.map((c) => c.name),
+    beats: [4, 4, 4, 4],
+    skeletonId,
+    skeletonLabel: CADENCE_SKELETON_LABELS[skeletonId],
+    endingId: result.endingId,
+    endingLabel: CADENCE_ENDING_LABELS[result.endingId],
+  };
+}
+
+// ============================================================
+// カデンツ理論エンジン — マイナーキー（自然・和声・旋律短音階）
+// ============================================================
+interface MinorPatternEntry {
+  degree: ChordDegree;
+  beats: BlockBeats;
+}
+
+interface MinorCadencePattern {
+  id: string;
+  label: string;
+  entries: MinorPatternEntry[];
+}
+
+const MINOR_CADENCE_PATTERNS: MinorCadencePattern[] = [
+  {
+    id: "minor_royal",
+    label: "王道マイナー進行 (Im→bVI→bVII→Im)",
+    entries: [
+      { degree: "Im", beats: 4 },
+      { degree: "bVI", beats: 4 },
+      { degree: "bVII", beats: 4 },
+      { degree: "Im", beats: 4 },
+    ],
+  },
+  {
+    id: "andalusian",
+    label: "アンダルシア進行 (Im→bVII→bVI→V7)",
+    entries: [
+      { degree: "Im", beats: 4 },
+      { degree: "bVII", beats: 4 },
+      { degree: "bVI", beats: 4 },
+      { degree: "V7", beats: 4 },
+    ],
+  },
+  {
+    id: "minor_251",
+    label: "マイナーツーファイブワン (IIm7b5→V7→Im)",
+    entries: [
+      { degree: "IIm7b5", beats: 4 },
+      { degree: "V7", beats: 4 },
+      { degree: "Im", beats: 8 },
+    ],
+  },
+  {
+    id: "jpop_setsunai",
+    label: "J-POP切ない系 (bVImaj7→bVII7→Im)",
+    entries: [
+      { degree: "bVI", beats: 4 },
+      { degree: "bVII7", beats: 4 },
+      { degree: "Im", beats: 8 },
+    ],
+  },
+  {
+    id: "subdominant_minor_resolve",
+    label: "サブドミナントマイナー解決 (IVm7→V7→Im)",
+    entries: [
+      { degree: "IVm", beats: 4 },
+      { degree: "V7", beats: 4 },
+      { degree: "Im", beats: 8 },
+    ],
+  },
+];
+
+interface MinorPatternResult {
+  kind: "minor";
+  chords: string[];
+  beats: BlockBeats[];
+  patternId: string;
+  patternLabel: string;
+}
+
+function generateMinorCadenceProgression(patternId: string): MinorPatternResult {
+  const pattern = MINOR_CADENCE_PATTERNS.find((p) => p.id === patternId) ?? MINOR_CADENCE_PATTERNS[0];
+  const chords: string[] = [];
+  let prevName: string | undefined;
+  for (const entry of pattern.entries) {
+    const chord = pickByDegreeFrom(MINOR_CHORD_LIBRARY, [entry.degree], prevName);
+    chords.push(chord.name);
+    prevName = chord.name;
+  }
+  return {
+    kind: "minor",
+    chords,
+    beats: pattern.entries.map((e) => e.beats),
+    patternId: pattern.id,
+    patternLabel: pattern.label,
+  };
+}
+
+type GenerationResult = CadenceResult | MinorPatternResult;
+
+interface ProgressionPreset {
+  id: string;
+  label: string;
+  chords: string[];
+}
+
+// 記事で紹介される王道進行プリセット（度数はDegree表記。Key C基準）
+const PROGRESSION_PRESETS: ProgressionPreset[] = [
+  { id: "yakusoku_4536", label: "J-POP王道 (4-5-3-6)", chords: ["F", "G", "Em", "Am"] },
+  { id: "canon_1563", label: "カノン進行 (1-5-6-3)", chords: ["C", "G", "Am", "Em"] },
+  { id: "komuro_6451", label: "小室進行 (6-4-5-1)", chords: ["Am", "F", "G", "C"] },
+  { id: "poppunk_1564", label: "ポップパンク進行 (1-5-6-4)", chords: ["C", "G", "Am", "F"] },
+  { id: "just_two_4361", label: "Just the Two of Us系 (4-3-6-1)", chords: ["Fmaj7", "Em7", "Am7", "Cmaj7"] },
+];
+
+// 和声リズム・タイムストレッチ: 1ブロック = 1コード。長さは拍単位（1/2/4/8拍）で可変。
+type BlockBeats = 1 | 2 | 4 | 8;
+
+interface ProgressionBlock {
+  id: string;
+  chord: string;
+  beats: BlockBeats;
+}
+
+let progressionBlockSeq = 0;
+function createProgressionBlock(chord: string, beats: BlockBeats = 4): ProgressionBlock {
+  progressionBlockSeq += 1;
+  return { id: `blk-${progressionBlockSeq}`, chord, beats };
+}
+
+// "mute": ミュートストローク（全弦を打楽器的にチャックする奏法）
+type StrokeDir = "down" | "up" | "none" | "mute";
+
 interface StrokeAction {
-  dir: "down" | "up" | "none";
+  dir: StrokeDir;
   accent?: boolean;
 }
+
+// エディタでステップをクリックした時に巡回する順序
+const STROKE_DIR_CYCLE: StrokeDir[] = ["none", "down", "up", "mute"];
 
 interface StrokePattern {
   id: string;
@@ -108,7 +517,110 @@ const DEFAULT_MELODY_PATTERNS: MelodyPattern[] = [
   { id: "m10", name: "10. ランダム・変則ノリ", mask: [true, true, false, true, false, true, true, false, true, false, true, true, false, true, false, true] },
 ];
 
+// ============================================================
+// アルペジオモード
+// ============================================================
+// 演奏モード: ストローク（コード弾き）/ アルペジオ（指弾き・弦個別指定）
+type PlayMode = "stroke" | "arpeggio";
+
+type ArpeggioSteps = 8 | 16;
+
+interface ArpeggioPattern {
+  id: string;
+  name: string;
+  steps: ArpeggioSteps;
+  // grid[stringIndex][stepIndex]。stringIndex: 0=6弦(低E)...5=1弦(高E)。OPEN_STRINGS_FREQ/frets配列と同じ並び。
+  grid: boolean[][];
+}
+
+function makeEmptyArpeggioGrid(steps: ArpeggioSteps): boolean[][] {
+  return Array.from({ length: 6 }, () => Array(steps).fill(false));
+}
+
+function cloneArpeggioPattern(pattern: ArpeggioPattern): ArpeggioPattern {
+  return { ...pattern, grid: pattern.grid.map((row) => [...row]) };
+}
+
+// 指定ステップ数へグリッドを再分配（可能な範囲で既存の打点位置を保つ）
+function resizeArpeggioGrid(pattern: ArpeggioPattern, steps: ArpeggioSteps): ArpeggioPattern {
+  if (steps === pattern.steps) return cloneArpeggioPattern(pattern);
+  const factor = steps / pattern.steps;
+  const grid = pattern.grid.map((row) => {
+    if (factor < 1) {
+      // 16→8: 2ステップに1つ間引いてサンプリング
+      const ratio = Math.round(1 / factor);
+      return row.filter((_, i) => i % ratio === 0);
+    }
+    // 8→16: 各打点を等間隔に引き伸ばして配置
+    const next = Array(steps).fill(false);
+    row.forEach((v, i) => {
+      if (v) next[Math.round(i * factor)] = true;
+    });
+    return next;
+  });
+  return { id: "custom", name: "カスタム", steps, grid };
+}
+
+const ARPEGGIO_PRESETS: ArpeggioPattern[] = [
+  {
+    id: "arp_root_climb",
+    name: "1. ルートから駆け上がり (6→3→2→1弦)",
+    steps: 16,
+    grid: (() => {
+      const g = makeEmptyArpeggioGrid(16);
+      g[0][0] = true; // 6弦(ルート) 1拍目
+      g[3][4] = true; // 3弦 2拍目
+      g[4][8] = true; // 2弦 3拍目
+      g[5][12] = true; // 1弦 4拍目
+      return g;
+    })(),
+  },
+  {
+    id: "arp_pima",
+    name: "2. PIMA基本（親指ベース+3本指）",
+    steps: 16,
+    grid: (() => {
+      const g = makeEmptyArpeggioGrid(16);
+      [0, 8].forEach((s) => (g[0][s] = true)); // 親指(ベース弦) 1,3拍目
+      [4, 12].forEach((s) => (g[1][s] = true)); // 親指(交互ベース) 2,4拍目
+      g[3][2] = true;
+      g[2][6] = true;
+      g[4][10] = true;
+      g[5][14] = true;
+      return g;
+    })(),
+  },
+  {
+    id: "arp_16th_cascade",
+    name: "3. 16分カスケード（低→高→低）",
+    steps: 16,
+    grid: (() => {
+      const g = makeEmptyArpeggioGrid(16);
+      const order = [0, 1, 2, 3, 4, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5];
+      order.forEach((stringIdx, step) => {
+        g[stringIdx][step] = true;
+      });
+      return g;
+    })(),
+  },
+  {
+    id: "arp_8th_simple",
+    name: "4. シンプル8分（低音→高音）",
+    steps: 8,
+    grid: (() => {
+      const g = makeEmptyArpeggioGrid(8);
+      const order = [0, 3, 4, 5, 0, 3, 4, 5];
+      order.forEach((stringIdx, step) => {
+        g[stringIdx][step] = true;
+      });
+      return g;
+    })(),
+  },
+];
+
 const KEY_OFFSET_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+// マイナーキー名。keyOffset=0 は Key Am（MINOR_CHORD_LIBRARY の基準キー）
+const MINOR_KEY_NAMES = ["Am", "A#m", "Bm", "Cm", "C#m", "Dm", "D#m", "Em", "Fm", "F#m", "Gm", "G#m"];
 
 interface MidiEvent {
   ticks: number;
@@ -221,12 +733,35 @@ export default function GuitarComposer() {
   // 設定
   const [bpm, setBpm] = useState(110);
   const [keyOffset, setKeyOffset] = useState(0);
+  const [keyMode, setKeyMode] = useState<KeyMode>("major");
   const [selectedPatternId, setSelectedPatternId] = useState<string>("pattern_6");
-  const [progression, setProgression] = useState<string[]>(["C", "G", "Am", "F"]);
+  const [selectedMinorPatternId, setSelectedMinorPatternId] = useState<string>(MINOR_CADENCE_PATTERNS[0].id);
+  const [progression, setProgression] = useState<ProgressionBlock[]>(() =>
+    ["C", "G", "Am", "F"].map((chord) => createProgressionBlock(chord, 4))
+  );
+  // カデンツ生成エンジンで作った直近の進行の理論的な内訳（骨格＋終止形、または短調パターン名）。手動編集/プリセット適用で null に戻す。
+  const [lastCadenceResult, setLastCadenceResult] = useState<GenerationResult | null>(null);
   const [strokeQuantizeMode, setStrokeQuantizeMode] = useState<boolean>(false);
+
+  // 演奏モード（ストローク/アルペジオ）
+  const [playMode, setPlayMode] = useState<PlayMode>("stroke");
+  // プリセットから編集を始めると null でなくなり、以後はこちらが優先される
+  const [customStrokeActions, setCustomStrokeActions] = useState<StrokeAction[] | null>(null);
+  const [arpeggioPattern, setArpeggioPattern] = useState<ArpeggioPattern>(() => cloneArpeggioPattern(ARPEGGIO_PRESETS[0]));
+
+  // 現在再生に使う実際のストロークパターン（カスタム編集があればそちらを優先）
+  const activeStrokeActions = useMemo(() => {
+    if (customStrokeActions) return customStrokeActions;
+    return STROKE_PATTERNS.find((p) => p.id === selectedPatternId)?.actions ?? STROKE_PATTERNS[0].actions;
+  }, [customStrokeActions, selectedPatternId]);
+
+  // 現在のキー（長調/短調）に対応するコードライブラリ
+  const activeChordLibrary = useMemo(() => getChordLibraryForMode(keyMode), [keyMode]);
+  const activeFunctionGroups = useMemo(() => getFunctionGroupsForMode(keyMode), [keyMode]);
 
   const [melodyPatterns, setMelodyPatterns] = useState<MelodyPattern[]>(DEFAULT_MELODY_PATTERNS);
   const [selectedMelodyPatternId, setSelectedMelodyPatternId] = useState<string>("m1");
+  const [melodyEnabled, setMelodyEnabled] = useState<boolean>(true);
 
   const [noteDensity, setNoteDensity] = useState<number>(50);
 
@@ -249,6 +784,18 @@ export default function GuitarComposer() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentStep, setCurrentStep] = useState(-1);
   const [currentBar, setCurrentBar] = useState(0);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
+
+  // クラウドプリセット（Supabase）
+  const [cloudPresets, setCloudPresets] = useState<CloudPreset[]>([]);
+  const [isLoadingPresets, setIsLoadingPresets] = useState(false);
+  const [isSavingPreset, setIsSavingPreset] = useState(false);
+  const [isSaveModalOpen, setIsSaveModalOpen] = useState(false);
+  const [saveNameInput, setSaveNameInput] = useState("");
+  const [isPresetLibraryOpen, setIsPresetLibraryOpen] = useState(false);
+  const [deletingPresetId, setDeletingPresetId] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
 
   // スケジューラー参照
   const isPlayingRef = useRef(false);
@@ -257,28 +804,40 @@ export default function GuitarComposer() {
   const countInRemainingStepsRef = useRef(0);
   const bpmRef = useRef(bpm);
   const keyOffsetRef = useRef(keyOffset);
+  const keyModeRef = useRef(keyMode);
   const selectedPatternIdRef = useRef(selectedPatternId);
   const selectedMelodyPatternIdRef = useRef(selectedMelodyPatternId);
   const melodyPatternsRef = useRef(melodyPatterns);
+  const melodyEnabledRef = useRef(melodyEnabled);
   const progressionRef = useRef(progression);
   const strokeQuantizeModeRef = useRef(strokeQuantizeMode);
+  const playModeRef = useRef(playMode);
+  const activeStrokeActionsRef = useRef(activeStrokeActions);
+  const arpeggioPatternRef = useRef(arpeggioPattern);
 
   const allowPassingTonesRef = useRef(allowPassingTones);
   const allowOnlyShortNotesRef = useRef(allowOnlyShortNotes);
   const forceChordToneOnChordChangeRef = useRef(forceChordToneOnChordChange);
 
   const nextNoteTimeRef = useRef(0);
-  const currentStepRef = useRef(0);
-  const currentBarRef = useRef(0);
+  // currentLocalStepRef: 現在のブロック内でのローカル16分音符ステップ（ブロックの拍数により範囲が可変）
+  // currentBlockIndexRef: progression配列上の現在のコードブロックのインデックス
+  const currentLocalStepRef = useRef(0);
+  const currentBlockIndexRef = useRef(0);
   const timerIdRef = useRef<number | null>(null);
 
   useEffect(() => { bpmRef.current = bpm; }, [bpm]);
   useEffect(() => { keyOffsetRef.current = keyOffset; }, [keyOffset]);
+  useEffect(() => { keyModeRef.current = keyMode; }, [keyMode]);
   useEffect(() => { selectedPatternIdRef.current = selectedPatternId; }, [selectedPatternId]);
   useEffect(() => { selectedMelodyPatternIdRef.current = selectedMelodyPatternId; }, [selectedMelodyPatternId]);
   useEffect(() => { melodyPatternsRef.current = melodyPatterns; }, [melodyPatterns]);
+  useEffect(() => { melodyEnabledRef.current = melodyEnabled; }, [melodyEnabled]);
   useEffect(() => { progressionRef.current = progression; }, [progression]);
   useEffect(() => { strokeQuantizeModeRef.current = strokeQuantizeMode; }, [strokeQuantizeMode]);
+  useEffect(() => { playModeRef.current = playMode; }, [playMode]);
+  useEffect(() => { activeStrokeActionsRef.current = activeStrokeActions; }, [activeStrokeActions]);
+  useEffect(() => { arpeggioPatternRef.current = arpeggioPattern; }, [arpeggioPattern]);
 
   useEffect(() => { allowPassingTonesRef.current = allowPassingTones; }, [allowPassingTones]);
   useEffect(() => { allowOnlyShortNotesRef.current = allowOnlyShortNotes; }, [allowOnlyShortNotes]);
@@ -331,45 +890,67 @@ export default function GuitarComposer() {
   }, [ensureAudioContext]);
 
   const playSingleStringScheduled = useCallback(
-    (freq: number, time: number, isAccent: boolean, midiNote: number, delayTicks: number = 0) => {
+    (freq: number, time: number, isAccent: boolean, midiNote: number, delayTicks: number = 0, muted: boolean = false) => {
       const ctx = ensureAudioContext();
-      const duration = 2.0;
+
+      // ヒューマナイズ: 微小なタイミングの揺らぎ（±3ms）。生演奏らしいバラつきを加える。
+      const humanizeTimeJitterSec = (Math.random() - 0.5) * 0.006;
+      const actualTime = Math.max(ctx.currentTime, time + humanizeTimeJitterSec);
+
+      const duration = muted ? 0.07 : 2.0;
 
       const master = ctx.createGain();
-      const volume = isAccent ? 0.35 : 0.22;
+      const baseVolume = isAccent ? 0.35 : 0.22;
+      const volume = muted ? baseVolume * 0.55 : baseVolume;
 
-      master.gain.setValueAtTime(0.0001, time);
-      master.gain.linearRampToValueAtTime(volume, time + 0.005);
-      master.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+      master.gain.setValueAtTime(0.0001, actualTime);
+      master.gain.linearRampToValueAtTime(volume, actualTime + (muted ? 0.002 : 0.005));
+      master.gain.exponentialRampToValueAtTime(0.0001, actualTime + duration);
       master.connect(ctx.destination);
 
-      const partials = [
-        { mult: 1, gain: 1.0, type: "sine" as OscillatorType },
-        { mult: 2, gain: 0.3, type: "sine" as OscillatorType },
-        { mult: 3, gain: 0.15, type: "triangle" as OscillatorType },
-      ];
+      // ミュートストロークは打楽器的な「チャック」音を短いディケイで表現する
+      const partials = muted
+        ? [
+            { mult: 1, gain: 1.0, type: "triangle" as OscillatorType },
+            { mult: 2.4, gain: 0.5, type: "square" as OscillatorType },
+          ]
+        : [
+            { mult: 1, gain: 1.0, type: "sine" as OscillatorType },
+            { mult: 2, gain: 0.3, type: "sine" as OscillatorType },
+            { mult: 3, gain: 0.15, type: "triangle" as OscillatorType },
+          ];
 
       partials.forEach((p) => {
         const osc = ctx.createOscillator();
         osc.type = p.type;
-        osc.frequency.setValueAtTime(freq * p.mult, time);
+        osc.frequency.setValueAtTime(freq * p.mult, actualTime);
 
         const g = ctx.createGain();
-        g.gain.setValueAtTime(p.gain, time);
-        g.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+        g.gain.setValueAtTime(p.gain, actualTime);
+        g.gain.exponentialRampToValueAtTime(0.0001, actualTime + duration);
 
         osc.connect(g);
         g.connect(master);
-        osc.start(time);
-        osc.stop(time + duration + 0.05);
+        osc.start(actualTime);
+        osc.stop(actualTime + duration + 0.05);
       });
 
       if (isRecordingRef.current) {
-        const tick = totalTickCounterRef.current + (strokeQuantizeModeRef.current ? 0 : delayTicks);
+        // ヒューマナイズ: 微小なベロシティの揺らぎ（±5）
+        const baseVelocity = isAccent ? 95 : 75;
+        const velocityJitter = Math.floor((Math.random() - 0.5) * 10);
+        const velocity = muted
+          ? Math.max(1, Math.min(60, 40 + velocityJitter))
+          : Math.max(1, Math.min(127, baseVelocity + velocityJitter));
+
+        const ticksPerSecond = (96 * bpmRef.current) / 60;
+        const humanizeTimeJitterTicks = Math.round(humanizeTimeJitterSec * ticksPerSecond);
+        const tick = totalTickCounterRef.current + (strokeQuantizeModeRef.current ? 0 : delayTicks + humanizeTimeJitterTicks);
+        const noteOffOffset = muted ? 4 : 20;
         setRecordedEvents((prev) => [
           ...prev,
-          { ticks: tick, type: "noteOn", channel: 0, note: midiNote, velocity: isAccent ? 95 : 75 },
-          { ticks: tick + 20, type: "noteOff", channel: 0, note: midiNote, velocity: 0 },
+          { ticks: tick, type: "noteOn", channel: 0, note: midiNote, velocity },
+          { ticks: tick + noteOffOffset, type: "noteOff", channel: 0, note: midiNote, velocity: 0 },
         ]);
       }
     },
@@ -472,7 +1053,8 @@ export default function GuitarComposer() {
 
   const getAutoMelodyFreqAndNote = useCallback(
     (chordName: string, yRatio: number, step: number, mask: boolean[]) => {
-      const chord = DIATONIC_CHORDS.find((c) => c.name === chordName) || DIATONIC_CHORDS[0];
+      const library = getChordLibraryForMode(keyModeRef.current);
+      const chord = library.find((c) => c.name === chordName) || library[0];
 
       let noteDurationSteps = 1;
       for (let i = step + 1; i < step + 16; i++) {
@@ -529,10 +1111,11 @@ export default function GuitarComposer() {
   );
 
   const scheduleStroke = useCallback(
-    (chordName: string, dir: "down" | "up", isAccent: boolean, time: number) => {
-      if (dir === "none") return;
-      const chord = DIATONIC_CHORDS.find((c) => c.name === chordName);
+    (chordName: string, dir: "down" | "up" | "mute", isAccent: boolean, time: number) => {
+      const chord = getChordLibraryForMode(keyModeRef.current).find((c) => c.name === chordName);
       if (!chord) return;
+
+      const isMuted = dir === "mute";
 
       const stringFreqs: { freq: number; midiNote: number }[] = [];
       chord.frets.forEach((fret, stringIdx) => {
@@ -541,8 +1124,7 @@ export default function GuitarComposer() {
           const totalFret = fret + keyOffsetRef.current;
           const freq = openFreq * Math.pow(2, totalFret / 12);
 
-          const baseMidi = [40, 45, 50, 55, 59, 64][stringIdx];
-          const midiNote = baseMidi + totalFret;
+          const midiNote = OPEN_STRING_MIDI[stringIdx] + totalFret;
 
           stringFreqs.push({ freq, midiNote });
         }
@@ -554,11 +1136,11 @@ export default function GuitarComposer() {
       // ・テンポが速いほど16分音符の枠が狭くなるので、スプレッドもそれに合わせて縮む
       //   （次の音符に食い込まないよう、16分音符幅に対する割合で計算する）。
       // ・アップストロークはダウンより手の動きが緩く、やや広がりが出る。
-      // ・アクセント（強く弾く）は鋭くタイトになる。
+      // ・アクセント（強く弾く）は鋭くタイトになる。ミュートは全弦をほぼ同時にチャックするのでさらにタイト。
       const secondsPerBeat = 60 / bpmRef.current;
       const secondsPer16th = secondsPerBeat / 4;
 
-      const dirSpreadMultiplier = dir === "up" ? 1.25 : 1.0;
+      const dirSpreadMultiplier = isMuted ? 0.4 : dir === "up" ? 1.25 : 1.0;
       const accentSpreadMultiplier = isAccent ? 0.7 : 1.0;
 
       const totalSpreadSec = secondsPer16th * 0.35 * dirSpreadMultiplier * accentSpreadMultiplier;
@@ -570,7 +1152,40 @@ export default function GuitarComposer() {
       stringFreqs.forEach((item, i) => {
         const delaySec = i * perStringDelaySec;
         const delayTicks = Math.round(delaySec * ticksPerSecond);
-        playSingleStringScheduled(item.freq, time + delaySec, isAccent, item.midiNote, delayTicks);
+        playSingleStringScheduled(item.freq, time + delaySec, isAccent, item.midiNote, delayTicks, isMuted);
+      });
+    },
+    [playSingleStringScheduled]
+  );
+
+  // アルペジオモード: 指定ステップでON になっている弦だけを、現在のコードのボイシングに従って
+  // 指弾き風の微小ディレイを付けながら発音する。
+  const scheduleArpeggioStep = useCallback(
+    (chordName: string, arpStepIndex: number, time: number) => {
+      const chord = getChordLibraryForMode(keyModeRef.current).find((c) => c.name === chordName);
+      if (!chord) return;
+      const pattern = arpeggioPatternRef.current;
+
+      const activeStrings: number[] = [];
+      for (let s = 0; s < 6; s++) {
+        if (pattern.grid[s]?.[arpStepIndex]) activeStrings.push(s);
+      }
+      if (activeStrings.length === 0) return;
+
+      const secondsPerBeat = 60 / bpmRef.current;
+      const secondsPer16th = secondsPerBeat / 4;
+      const perNoteDelaySec = Math.min(0.03, secondsPer16th * 0.2);
+      const ticksPerSecond = (96 * bpmRef.current) / 60;
+
+      activeStrings.forEach((stringIdx, i) => {
+        const fret = chord.frets[stringIdx];
+        if (fret === -1) return; // このボイシングでミュートされている弦は発音不可
+        const totalFret = fret + keyOffsetRef.current;
+        const freq = OPEN_STRINGS_FREQ[stringIdx] * Math.pow(2, totalFret / 12);
+        const midiNote = OPEN_STRING_MIDI[stringIdx] + totalFret;
+        const delaySec = i * perNoteDelaySec;
+        const delayTicks = Math.round(delaySec * ticksPerSecond);
+        playSingleStringScheduled(freq, time + delaySec, false, midiNote, delayTicks, false);
       });
     },
     [playSingleStringScheduled]
@@ -600,32 +1215,48 @@ export default function GuitarComposer() {
           setIsCountingIn(false);
           isRecordingRef.current = true;
           setIsRecording(true);
-          currentStepRef.current = 0;
-          currentBarRef.current = 0;
+          currentLocalStepRef.current = 0;
+          currentBlockIndexRef.current = 0;
           totalTickCounterRef.current = 0;
         }
         continue;
       }
 
-      const strokePattern = STROKE_PATTERNS.find((p) => p.id === selectedPatternIdRef.current)!;
       const melodyPattern = melodyPatternsRef.current.find((p) => p.id === selectedMelodyPatternIdRef.current) || melodyPatternsRef.current[0];
 
-      const step = currentStepRef.current;
-      const bar = currentBarRef.current;
-      const chord = progressionRef.current[bar];
+      const block = progressionRef.current[currentBlockIndexRef.current];
+      const stepsInBlock = Math.max(1, block.beats * 4);
+      // patternIndex は「標準4拍・16分音符グリッド」上の絶対位置（0-15）。BPMに対する
+      // 16分音符の実時間（secondsPer16th）は拍数に関係なく常に一定なので、これでグリッド速度が
+      // 常に固定される。
+      // ・ブロックが4拍未満（圧縮）: stepsInBlockに達した時点で次のブロックへ切り替わるため、
+      //   自動的にパターンの前半だけが再生される「切り詰め」になる（速度は変わらない）。
+      // ・ブロックが4拍超（伸長, 8拍）: patternIndexが0-15を2周するので、標準パターンが
+      //   同じ速度のままもう一度繰り返される。
+      const patternIndex = currentLocalStepRef.current % 16;
+      const chord = block.chord;
 
-      const strokeAction = strokePattern.actions[step];
-      if (strokeAction && strokeAction.dir !== "none") {
-        scheduleStroke(chord, strokeAction.dir, !!strokeAction.accent, nextNoteTimeRef.current);
+      if (playModeRef.current === "stroke") {
+        const strokeAction = activeStrokeActionsRef.current[patternIndex];
+        if (strokeAction && strokeAction.dir !== "none") {
+          scheduleStroke(chord, strokeAction.dir, !!strokeAction.accent, nextNoteTimeRef.current);
+        }
+      } else {
+        const pattern = arpeggioPatternRef.current;
+        const window = 16 / pattern.steps;
+        if (patternIndex % window === 0) {
+          const arpStepIndex = Math.floor(patternIndex / window);
+          scheduleArpeggioStep(chord, arpStepIndex, nextNoteTimeRef.current);
+        }
       }
 
-      if (melodyPattern.mask[step]) {
-        const { freq, midiNote } = getAutoMelodyFreqAndNote(chord, paletteYRef.current, step, melodyPattern.mask);
+      if (melodyEnabledRef.current && melodyPattern.mask[patternIndex]) {
+        const { freq, midiNote } = getAutoMelodyFreqAndNote(chord, paletteYRef.current, patternIndex, melodyPattern.mask);
         playMelodyScheduled(freq, nextNoteTimeRef.current, midiNote);
       }
 
-      const s = step;
-      const b = bar;
+      const s = patternIndex;
+      const b = currentBlockIndexRef.current;
       setTimeout(() => {
         setCurrentStep(s);
         setCurrentBar(b);
@@ -637,17 +1268,17 @@ export default function GuitarComposer() {
       nextNoteTimeRef.current += secondsPer16th;
       totalTickCounterRef.current += 24;
 
-      currentStepRef.current++;
-      if (currentStepRef.current >= 16) {
-        currentStepRef.current = 0;
-        currentBarRef.current = (currentBarRef.current + 1) % progressionRef.current.length;
+      currentLocalStepRef.current++;
+      if (currentLocalStepRef.current >= stepsInBlock) {
+        currentLocalStepRef.current = 0;
+        currentBlockIndexRef.current = (currentBlockIndexRef.current + 1) % progressionRef.current.length;
       }
     }
 
     if (isPlayingRef.current) {
       timerIdRef.current = window.setTimeout(scheduler, 25);
     }
-  }, [ensureAudioContext, scheduleStroke, getAutoMelodyFreqAndNote, playMelodyScheduled, playCountInClick]);
+  }, [ensureAudioContext, scheduleStroke, scheduleArpeggioStep, getAutoMelodyFreqAndNote, playMelodyScheduled, playCountInClick]);
 
   // 再生・カウントイン・録音をすべて止めて無音の状態に戻す
   const stopAll = useCallback(() => {
@@ -679,8 +1310,8 @@ export default function GuitarComposer() {
       // resume 待ちの間に停止ボタンが押されていたら再生開始をキャンセル
       if (!isPlayingRef.current) return;
 
-      currentStepRef.current = 0;
-      currentBarRef.current = 0;
+      currentLocalStepRef.current = 0;
+      currentBlockIndexRef.current = 0;
       totalTickCounterRef.current = 0;
       nextNoteTimeRef.current = ctx.currentTime + 0.05;
       scheduler();
@@ -709,8 +1340,8 @@ export default function GuitarComposer() {
     resumeAudioContext().then((ctx) => {
       if (!isPlayingRef.current) return;
 
-      currentStepRef.current = 0;
-      currentBarRef.current = 0;
+      currentLocalStepRef.current = 0;
+      currentBlockIndexRef.current = 0;
       totalTickCounterRef.current = 0;
       countInRemainingStepsRef.current = 16; // 4拍分 = 16分音符16ステップ
       setCountInBeatsLeft(4);
@@ -751,15 +1382,187 @@ export default function GuitarComposer() {
   };
 
   const handleChordChange = (index: number, newChord: string) => {
-    const next = [...progression];
-    next[index] = newChord;
-    setProgression(next);
+    setProgression((prev) => prev.map((b, i) => (i === index ? { ...b, chord: newChord } : b)));
+    setLastCadenceResult(null);
   };
+
+  const handleBeatsChange = (index: number, beats: BlockBeats) => {
+    setProgression((prev) => prev.map((b, i) => (i === index ? { ...b, beats } : b)));
+  };
+
+  const setAllBeats = (beats: BlockBeats) => {
+    setProgression((prev) => prev.map((b) => ({ ...b, beats })));
+  };
+
+  // 前後（ループも含む）のベース音の関係を判定: "same"=同音(ペダル) / "step"=半音・全音の順次進行
+  const smoothBassInfo = useMemo(() => {
+    const n = progression.length;
+    if (n === 0) return [] as ("same" | "step" | null)[];
+    const bassNotes = progression.map((block) => {
+      const chord = activeChordLibrary.find((c) => c.name === block.chord);
+      return chord ? getChordBassMidiNote(chord) : 0;
+    });
+    const outgoingRelation = bassNotes.map((note, i): "same" | "step" | null => {
+      if (n <= 1) return null;
+      const nextNote = bassNotes[(i + 1) % n];
+      const diff = Math.abs(nextNote - note);
+      if (diff === 0) return "same";
+      if (diff === 1 || diff === 2) return "step";
+      return null;
+    });
+    return bassNotes.map((_, i) => outgoingRelation[i] ?? outgoingRelation[(i - 1 + n) % n]);
+  }, [progression, activeChordLibrary]);
 
   const updatePaletteY = (clientY: number, rect: DOMRect) => {
     const y = clientY - rect.top;
     const ratio = 1.0 - Math.max(0, Math.min(1, y / rect.height));
     setPaletteY(ratio);
+  };
+
+  // ストロークのステップをクリック: none→down→up→mute を巡回
+  const cycleStrokeStep = (index: number) => {
+    setCustomStrokeActions((prev) => {
+      const base = (prev ?? activeStrokeActions).map((a) => ({ ...a }));
+      const current = base[index].dir;
+      const nextDir = STROKE_DIR_CYCLE[(STROKE_DIR_CYCLE.indexOf(current) + 1) % STROKE_DIR_CYCLE.length];
+      base[index] = { dir: nextDir, accent: nextDir === "down" || nextDir === "up" ? base[index].accent : false };
+      return base;
+    });
+  };
+
+  const toggleStrokeAccent = (index: number) => {
+    setCustomStrokeActions((prev) => {
+      const base = (prev ?? activeStrokeActions).map((a) => ({ ...a }));
+      base[index] = { ...base[index], accent: !base[index].accent };
+      return base;
+    });
+  };
+
+  const applyStrokePreset = (presetId: string) => {
+    setSelectedPatternId(presetId);
+    setCustomStrokeActions(null);
+  };
+
+  const toggleArpeggioCell = (stringIdx: number, stepIdx: number) => {
+    setArpeggioPattern((prev) => {
+      const grid = prev.grid.map((row) => [...row]);
+      grid[stringIdx][stepIdx] = !grid[stringIdx][stepIdx];
+      return { ...prev, id: "custom", name: "カスタム", grid };
+    });
+  };
+
+  // ============================================================
+  // クラウドプリセット（Supabase）
+  // ============================================================
+  const showToast = useCallback((type: "success" | "error", message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast({ type, message });
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  const fetchCloudPresets = useCallback(async () => {
+    setIsLoadingPresets(true);
+    try {
+      const { data, error } = await supabase
+        .from("presets")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      setCloudPresets((data as CloudPreset[] | null) ?? []);
+    } catch (e) {
+      showToast("error", `プリセット一覧の取得に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setIsLoadingPresets(false);
+    }
+  }, [showToast]);
+
+  // 初回マウント時に一覧を取得（エフェクト本体から直接setStateすると
+  // カスケードレンダーになるため、マイクロタスクにずらして呼び出す）
+  useEffect(() => {
+    Promise.resolve().then(() => fetchCloudPresets());
+  }, [fetchCloudPresets]);
+
+  const savePresetToCloud = async (name: string) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      showToast("error", "プリセット名を入力してください");
+      return;
+    }
+
+    setIsSavingPreset(true);
+    try {
+      // key_mode列がスキーマに無いため、短調は "Am" のように末尾"m"付きの表記で key_name に
+      // エンコードする（読み込み時に末尾"m"の有無で長調/短調を判定）
+      const payload: NewCloudPreset = {
+        name: trimmedName,
+        bpm,
+        key_name: keyMode === "major" ? KEY_OFFSET_NAMES[keyOffset] : MINOR_KEY_NAMES[keyOffset],
+        play_mode: playMode,
+        stroke_pattern: playMode === "stroke" ? JSON.stringify(activeStrokeActions) : null,
+        arpeggio_pattern: playMode === "arpeggio" ? (arpeggioPattern as unknown as Record<string, unknown>) : null,
+        chords: progression.map((b) => ({ chord: b.chord, beats: b.beats })),
+      };
+
+      const { error } = await supabase.from("presets").insert(payload);
+      if (error) throw error;
+
+      showToast("success", `「${trimmedName}」をクラウドに保存しました`);
+      setIsSaveModalOpen(false);
+      setSaveNameInput("");
+      fetchCloudPresets();
+    } catch (e) {
+      showToast("error", `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setIsSavingPreset(false);
+    }
+  };
+
+  const loadCloudPreset = (preset: CloudPreset) => {
+    setBpm(preset.bpm);
+    const isMinorKey = preset.key_name.endsWith("m");
+    const keyNames = isMinorKey ? MINOR_KEY_NAMES : KEY_OFFSET_NAMES;
+    const keyIdx = keyNames.indexOf(preset.key_name);
+    setKeyMode(isMinorKey ? "minor" : "major");
+    setKeyOffset(keyIdx >= 0 ? keyIdx : 0);
+    setPlayMode(preset.play_mode);
+    setLastCadenceResult(null);
+    setProgression(
+      (preset.chords ?? []).map((c) => createProgressionBlock(c.chord, (c.beats as BlockBeats) ?? 4))
+    );
+
+    if (preset.play_mode === "stroke") {
+      if (preset.stroke_pattern) {
+        try {
+          const actions = JSON.parse(preset.stroke_pattern) as StrokeAction[];
+          setCustomStrokeActions(actions);
+        } catch {
+          showToast("error", "ストロークパターンの読み込みに失敗しました（データ形式不正）");
+        }
+      } else {
+        setCustomStrokeActions(null);
+      }
+    } else if (preset.arpeggio_pattern) {
+      setArpeggioPattern(preset.arpeggio_pattern as unknown as ArpeggioPattern);
+    }
+
+    setIsPresetLibraryOpen(false);
+    showToast("success", `プリセット「${preset.name}」を読み込みました`);
+  };
+
+  const deleteCloudPreset = async (preset: CloudPreset) => {
+    if (!window.confirm(`プリセット「${preset.name}」をクラウドから削除しますか？この操作は取り消せません。`)) return;
+
+    setDeletingPresetId(preset.id);
+    try {
+      const { error } = await supabase.from("presets").delete().eq("id", preset.id);
+      if (error) throw error;
+      showToast("success", `「${preset.name}」を削除しました`);
+      setCloudPresets((prev) => prev.filter((p) => p.id !== preset.id));
+    } catch (e) {
+      showToast("error", `削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDeletingPresetId(null);
+    }
   };
 
   const hasAnyFilterOn = allowPassingTones || allowOnlyShortNotes;
@@ -827,9 +1630,287 @@ export default function GuitarComposer() {
               <Download className="w-4 h-4" />
               <span>MIDI出力</span>
             </button>
+
+            {/* クラウド保存ボタン */}
+            <button
+              onClick={() => setIsSaveModalOpen(true)}
+              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs border border-sky-500/50 text-sky-300 bg-sky-950/30 hover:bg-sky-900/50 transition-all shadow-md"
+            >
+              <CloudUpload className="w-4 h-4" />
+              <span>クラウドに保存</span>
+            </button>
+
+            {/* クラウドプリセット一覧ボタン */}
+            <button
+              onClick={() => {
+                setIsPresetLibraryOpen(true);
+                fetchCloudPresets();
+              }}
+              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs border border-sky-500/50 text-sky-300 bg-sky-950/30 hover:bg-sky-900/50 transition-all shadow-md"
+            >
+              {isLoadingPresets ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderOpen className="w-4 h-4" />}
+              <span>クラウドプリセット一覧{cloudPresets.length > 0 ? ` (${cloudPresets.length})` : ""}</span>
+            </button>
+
+            {/* ヘルプボタン */}
+            <button
+              onClick={() => setIsHelpOpen(true)}
+              aria-label="使い方・和声理論の解説を開く"
+              className="flex items-center justify-center w-9 h-9 rounded-full border border-stone-700 bg-stone-800 text-stone-300 hover:bg-stone-700 hover:text-amber-300 transition-all shadow-md"
+            >
+              <HelpCircle className="w-4 h-4" />
+            </button>
           </div>
         </div>
       </div>
+
+      {/* トースト通知 */}
+      {toast && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] max-w-[90vw]">
+          <div
+            className={`flex items-center gap-2 px-4 py-3 rounded-xl shadow-2xl border text-xs font-bold ${
+              toast.type === "success"
+                ? "bg-emerald-950 border-emerald-500/60 text-emerald-300"
+                : "bg-rose-950 border-rose-500/60 text-rose-300"
+            }`}
+          >
+            {toast.type === "success" ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertCircle className="w-4 h-4 shrink-0" />}
+            <span>{toast.message}</span>
+          </div>
+        </div>
+      )}
+
+      {/* クラウド保存モーダル */}
+      {isSaveModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          onClick={() => !isSavingPreset && setIsSaveModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm bg-stone-900 border border-stone-700 rounded-2xl shadow-2xl p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-bold flex items-center gap-2">
+                <CloudUpload className="w-5 h-5 text-sky-400" />
+                クラウドに保存
+              </h2>
+              <button
+                onClick={() => setIsSaveModalOpen(false)}
+                disabled={isSavingPreset}
+                aria-label="閉じる"
+                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-stone-800 text-stone-400 hover:text-white transition-colors disabled:opacity-40"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-[11px] text-stone-400 leading-relaxed">
+              現在のBPM・キー・演奏モード・コード進行（拍数含む）・{playMode === "stroke" ? "ストロークパターン" : "アルペジオパターン"}
+              をまとめてクラウドに保存します。
+            </p>
+
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold text-stone-500">プリセット名</label>
+              <input
+                type="text"
+                value={saveNameInput}
+                onChange={(e) => setSaveNameInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !isSavingPreset) savePresetToCloud(saveNameInput);
+                }}
+                placeholder="例: サビ用 王道進行"
+                autoFocus
+                className="w-full bg-stone-950 border border-stone-700 text-sm py-2 px-3 rounded-xl text-stone-100 outline-none focus:border-sky-500"
+              />
+            </div>
+
+            <button
+              onClick={() => savePresetToCloud(saveNameInput)}
+              disabled={isSavingPreset || saveNameInput.trim().length === 0}
+              className="w-full flex items-center justify-center gap-2 bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:hover:bg-sky-500 text-stone-950 font-bold py-2.5 rounded-xl transition-colors text-xs"
+            >
+              {isSavingPreset ? <Loader2 className="w-4 h-4 animate-spin" /> : <CloudUpload className="w-4 h-4" />}
+              {isSavingPreset ? "保存中…" : "保存する"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* クラウドプリセット一覧モーダル */}
+      {isPresetLibraryOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          onClick={() => setIsPresetLibraryOpen(false)}
+        >
+          <div
+            className="w-full max-w-lg max-h-[80vh] overflow-y-auto bg-stone-900 border border-stone-700 rounded-2xl shadow-2xl p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-bold flex items-center gap-2">
+                <Cloud className="w-5 h-5 text-sky-400" />
+                クラウドプリセット一覧
+              </h2>
+              <button
+                onClick={() => setIsPresetLibraryOpen(false)}
+                aria-label="閉じる"
+                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-stone-800 text-stone-400 hover:text-white transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {isLoadingPresets ? (
+              <div className="flex items-center justify-center gap-2 text-stone-400 text-xs py-8">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                読み込み中…
+              </div>
+            ) : cloudPresets.length === 0 ? (
+              <div className="text-center text-stone-500 text-xs py-8">
+                保存されたプリセットはまだありません。「クラウドに保存」から作成できます。
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {cloudPresets.map((preset) => (
+                  <div
+                    key={preset.id}
+                    className="flex items-center gap-2 bg-stone-950 border border-stone-800 rounded-xl p-3 hover:border-sky-500/50 transition-all"
+                  >
+                    <button onClick={() => loadCloudPreset(preset)} className="flex-1 text-left min-w-0">
+                      <div className="text-sm font-bold text-sky-300 truncate">{preset.name}</div>
+                      <div className="text-[10px] text-stone-500 font-mono truncate">
+                        BPM {preset.bpm} / Key {preset.key_name} / {preset.play_mode === "stroke" ? "ストローク" : "アルペジオ"} /{" "}
+                        {(preset.chords ?? []).map((c) => c.chord).join("-")}
+                      </div>
+                      <div className="text-[9px] text-stone-600 mt-0.5">
+                        {new Date(preset.created_at).toLocaleString("ja-JP")}
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => deleteCloudPreset(preset)}
+                      disabled={deletingPresetId === preset.id}
+                      aria-label={`${preset.name} を削除`}
+                      className="w-8 h-8 flex items-center justify-center rounded-lg text-stone-500 hover:text-rose-400 hover:bg-rose-950/40 transition-colors disabled:opacity-40 shrink-0"
+                    >
+                      {deletingPresetId === preset.id ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="w-4 h-4" />
+                      )}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 画面解説モーダル */}
+      {isHelpOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          onClick={() => setIsHelpOpen(false)}
+        >
+          <div
+            className="w-full max-w-lg max-h-[85vh] overflow-y-auto bg-stone-900 border border-stone-700 rounded-2xl shadow-2xl p-5 space-y-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-bold flex items-center gap-2">
+                <HelpCircle className="w-5 h-5 text-amber-400" />
+                コード進行エディタの見かた
+              </h2>
+              <button
+                onClick={() => setIsHelpOpen(false)}
+                aria-label="閉じる"
+                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-stone-800 text-stone-400 hover:text-white transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2 text-xs text-stone-300 leading-relaxed">
+              <h3 className="font-bold text-amber-300 flex items-center gap-1.5">
+                <Music2 className="w-3.5 h-3.5" /> 和声リズムの考え方
+              </h3>
+              <p>
+                コードが変わる頻度そのものが音楽の「動き」を作ります。同じコードが長く続く（拍数が多い）ほど響きは停滞・安定し、
+                短い間隔で頻繁に変わるほど推進力が生まれます。STEP2の「和声リズム」で各ブロックの長さ（拍数）を調整すると、
+                サビ前は倍速で畳みかけたり、決めのコードだけ倍長で伸ばしたりといった演出ができます。
+              </p>
+
+              <h3 className="font-bold text-amber-300 flex items-center gap-1.5 pt-1">
+                <Sparkles className="w-3.5 h-3.5" /> 機能和声（T / SD / D）の役割
+              </h3>
+              <ul className="space-y-1.5">
+                <li className="flex items-start gap-2">
+                  <span className={`mt-0.5 flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${FUNCTION_BADGE_STYLES.T.badge}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${FUNCTION_BADGE_STYLES.T.dot}`} />T
+                  </span>
+                  <span><b>トニック（青）</b>: 曲の「家」にあたる最も安定したコード。フレーズの始まりや終わりに使われます。</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className={`mt-0.5 flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${FUNCTION_BADGE_STYLES.SD.badge}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${FUNCTION_BADGE_STYLES.SD.dot}`} />SD
+                  </span>
+                  <span><b>サブドミナント（黄緑）</b>: トニックから一歩離れた「展開」のコード。トニックにもドミナントにも進める橋渡し役。</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className={`mt-0.5 flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${FUNCTION_BADGE_STYLES.D.badge}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${FUNCTION_BADGE_STYLES.D.dot}`} />D
+                  </span>
+                  <span><b>ドミナント（オレンジ）</b>: 強い緊張と「解決したい」推進力を持つコード。トニックに戻ることで気持ちよく着地します。</span>
+                </li>
+              </ul>
+
+              <h3 className="font-bold text-amber-300 flex items-center gap-1.5 pt-1">
+                <Music4 className="w-3.5 h-3.5" /> 分数コード（オンコード）のメリット
+              </h3>
+              <p>
+                G/B や C/E のように「分子のコード / ベース音」で表される分数コードは、コードの響きはそのままに
+                ベース音だけを滑らかに繋げるためのテクニックです。ベースラインが階段状に動くことで、単純なコードの
+                並びよりも滑らかで浮遊感のある印象を作れます（例: C → G/B → Am で「ド→シ→ラ」と滑らかに下降）。
+              </p>
+
+              <h3 className="font-bold text-amber-300 flex items-center gap-1.5 pt-1">
+                <Sparkle className="w-3.5 h-3.5" /> 「✨ スムーズベース」「🔁 ベース同音」下線の意味
+              </h3>
+              <p>
+                隣り合う（ループ時は最後→最初も含む）コードの最低音（ベース音）の差が半音〜全音（1〜2半音）のときは
+                「✨ スムーズベース」、ベース音がまったく同じ（ペダルポイント）のときは「🔁 ベース同音」という
+                波線付きの表示が自動的に出ます。どちらもベースラインが滑らかに（あるいはどっしりと）繋がっている
+                証拠なので、分数コードを組み合わせる際の目安として活用してください。
+              </p>
+
+              <h3 className="font-bold text-amber-300 flex items-center gap-1.5 pt-1">
+                <Music2 className="w-3.5 h-3.5" /> 短調（マイナーキー）の和音について
+              </h3>
+              <p>
+                短調には3種類の音階があります。<b>自然短音階</b>はキー音から半音を含まない素直な並びで、
+                Em7（Vm7）のような穏やかなドミナントが得られます。<b>和声短音階</b>は7番目の音を半音上げたもので、
+                これにより E7（V7）という力強い長三和音のドミナントが生まれ、トニックマイナー（Im）へ強い
+                解決感を持って進行できます（なぜマイナーキーなのにE7のような長三和音が使えるかは、この
+                「導音を半音上げて緊張を作る」和声短音階の仕組みによるものです）。<b>旋律短音階</b>は
+                上行時に6番目・7番目の音も半音上げる形で、なめらかなメロディラインに使われます。
+              </p>
+              <p>
+                <b>マイナーツーファイブワン</b>（IIm7b5 → V7 → Im、例: Bm7b5 → E7 → Am7）は、長調のツーファイブワンの
+                短調版です。IIm7b5（半減7）が展開を作り、V7（和声短音階由来の強いドミナント）が緊張を最大化し、
+                Im（Im7）で解決する——という、短調でもっとも定番かつ実用的な進行です。
+              </p>
+            </div>
+
+            <button
+              onClick={() => setIsHelpOpen(false)}
+              className="w-full bg-amber-500 hover:bg-amber-400 text-stone-950 font-bold py-2.5 rounded-xl transition-colors text-xs"
+            >
+              閉じる
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="w-full max-w-4xl mx-auto p-4 sm:p-6 space-y-6">
         {/* コントロールパネル */}
@@ -854,21 +1935,51 @@ export default function GuitarComposer() {
 
           <div className="flex items-center gap-4">
             <Repeat className="w-5 h-5 text-stone-400" />
-            <div className="flex-1">
+            <div className="flex-1 space-y-1.5">
               <div className="flex justify-between text-xs font-bold mb-1">
                 <span>KEY / 移調</span>
                 <span className="text-amber-400 font-mono">
-                  {KEY_OFFSET_NAMES[keyOffset]} (Key +{keyOffset})
+                  {keyMode === "major" ? KEY_OFFSET_NAMES[keyOffset] : MINOR_KEY_NAMES[keyOffset]}
                 </span>
               </div>
+
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  onClick={() => {
+                    setKeyMode("major");
+                    setLastCadenceResult(null);
+                  }}
+                  className={`py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
+                    keyMode === "major"
+                      ? "bg-sky-500/20 border-sky-400 text-sky-300"
+                      : "bg-stone-800 border-stone-700 text-stone-400 hover:border-stone-600"
+                  }`}
+                >
+                  メジャー（長調）
+                </button>
+                <button
+                  onClick={() => {
+                    setKeyMode("minor");
+                    setLastCadenceResult(null);
+                  }}
+                  className={`py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
+                    keyMode === "minor"
+                      ? "bg-indigo-500/20 border-indigo-400 text-indigo-300"
+                      : "bg-stone-800 border-stone-700 text-stone-400 hover:border-stone-600"
+                  }`}
+                >
+                  マイナー（短調）
+                </button>
+              </div>
+
               <select
                 value={keyOffset}
                 onChange={(e) => setKeyOffset(parseInt(e.target.value, 10))}
                 className="w-full bg-stone-800 border border-stone-700 text-xs font-bold py-1.5 px-3 rounded-lg text-amber-300 outline-none"
               >
-                {KEY_OFFSET_NAMES.map((name, i) => (
+                {(keyMode === "major" ? KEY_OFFSET_NAMES : MINOR_KEY_NAMES).map((name, i) => (
                   <option key={i} value={i}>
-                    Key {name} {i === 0 ? "(原曲キー C)" : `(+${i} Capo)`}
+                    Key {name} {i === 0 ? `(原曲キー ${keyMode === "major" ? "C" : "Am"})` : `(+${i} Capo)`}
                   </option>
                 ))}
               </select>
@@ -876,96 +1987,426 @@ export default function GuitarComposer() {
           </div>
         </div>
 
-        {/* STEP 1: ストローク */}
-        <div className="space-y-2">
+        {/* STEP 1: 演奏スタイル */}
+        <div className="space-y-3">
           <label className="text-xs font-bold text-stone-400 tracking-wider">
-            STEP 1: ギターバッキングのリズムを選択
+            STEP 1: 演奏スタイルを選択
           </label>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {STROKE_PATTERNS.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => setSelectedPatternId(p.id)}
-                className={`p-2.5 rounded-xl text-left border transition-all ${
-                  selectedPatternId === p.id
-                    ? "bg-amber-500/10 border-amber-500 text-amber-300"
-                    : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
-                }`}
-              >
-                <div className="text-xs font-bold">{p.name}</div>
-              </button>
-            ))}
+
+          {/* 演奏モード切り替え */}
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={() => setPlayMode("stroke")}
+              className={`p-2.5 rounded-xl text-center border font-bold text-xs transition-all ${
+                playMode === "stroke"
+                  ? "bg-amber-500/20 border-amber-400 text-amber-300"
+                  : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
+              }`}
+            >
+              🎸 ストロークモード
+            </button>
+            <button
+              onClick={() => setPlayMode("arpeggio")}
+              className={`p-2.5 rounded-xl text-center border font-bold text-xs transition-all ${
+                playMode === "arpeggio"
+                  ? "bg-amber-500/20 border-amber-400 text-amber-300"
+                  : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
+              }`}
+            >
+              🎼 アルペジオモード
+            </button>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-            <button
-              onClick={() => setStrokeQuantizeMode(false)}
-              className={`p-2.5 rounded-xl text-left border transition-all ${
-                !strokeQuantizeMode
-                  ? "bg-amber-500/10 border-amber-500 text-amber-300"
-                  : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
-              }`}
-            >
-              <div className="text-xs font-bold">🎸 生ストローク (MIDIに時間差を記録)</div>
-              <div className="text-[10px] text-stone-400 font-normal">弦ごとのタイミングのズレをそのまま記録。ギターらしい質感。</div>
-            </button>
-            <button
-              onClick={() => setStrokeQuantizeMode(true)}
-              className={`p-2.5 rounded-xl text-left border transition-all ${
-                strokeQuantizeMode
-                  ? "bg-amber-500/10 border-amber-500 text-amber-300"
-                  : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
-              }`}
-            >
-              <div className="text-xs font-bold">📐 クオンタイズ (全弦を同時刻に記録)</div>
-              <div className="text-[10px] text-stone-400 font-normal">ストロークの全弦を1拍に揃えて記録。打ち込み向け。</div>
-            </button>
-          </div>
+          {playMode === "stroke" ? (
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {STROKE_PATTERNS.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => applyStrokePreset(p.id)}
+                    className={`p-2.5 rounded-xl text-left border transition-all ${
+                      selectedPatternId === p.id && !customStrokeActions
+                        ? "bg-amber-500/10 border-amber-500 text-amber-300"
+                        : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
+                    }`}
+                  >
+                    <div className="text-xs font-bold">{p.name}</div>
+                  </button>
+                ))}
+              </div>
+
+              {/* 16ステップ・ストロークエディタ */}
+              <div className="bg-stone-950 border border-stone-800 rounded-xl p-3 space-y-1">
+                <div className="text-[10px] font-bold text-stone-500">
+                  ステップをクリックで 休符→↓→↑→ミュート を切替。↓/↑の下の「accent」でアクセントON/OFF。
+                  {customStrokeActions && <span className="text-amber-400"> （カスタム編集中）</span>}
+                </div>
+                <div className="grid grid-cols-8 sm:grid-cols-16 gap-1">
+                  {activeStrokeActions.map((action, i) => (
+                    <div key={i} className="flex flex-col items-center gap-0.5">
+                      <button
+                        onClick={() => cycleStrokeStep(i)}
+                        className={`w-full aspect-square rounded-lg border text-sm font-bold flex items-center justify-center transition-all ${
+                          action.dir === "down"
+                            ? `bg-amber-500/20 border-amber-400 text-amber-300 ${action.accent ? "ring-1 ring-amber-300" : ""}`
+                            : action.dir === "up"
+                            ? `bg-emerald-500/20 border-emerald-400 text-emerald-300 ${action.accent ? "ring-1 ring-emerald-300" : ""}`
+                            : action.dir === "mute"
+                            ? "bg-rose-500/20 border-rose-400 text-rose-300"
+                            : "bg-stone-900 border-stone-800 text-stone-600"
+                        }`}
+                      >
+                        {action.dir === "down" ? "↓" : action.dir === "up" ? "↑" : action.dir === "mute" ? "✕" : "・"}
+                      </button>
+                      <button
+                        onClick={() => toggleStrokeAccent(i)}
+                        className={`text-[8px] leading-none h-3 ${
+                          action.dir === "down" || action.dir === "up"
+                            ? action.accent
+                              ? "text-amber-300 font-bold"
+                              : "text-stone-600"
+                            : "invisible"
+                        }`}
+                      >
+                        accent
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                <button
+                  onClick={() => setStrokeQuantizeMode(false)}
+                  className={`p-2.5 rounded-xl text-left border transition-all ${
+                    !strokeQuantizeMode
+                      ? "bg-amber-500/10 border-amber-500 text-amber-300"
+                      : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
+                  }`}
+                >
+                  <div className="text-xs font-bold">🎸 生ストローク (MIDIに時間差を記録)</div>
+                  <div className="text-[10px] text-stone-400 font-normal">弦ごとのタイミングのズレをそのまま記録。ギターらしい質感。</div>
+                </button>
+                <button
+                  onClick={() => setStrokeQuantizeMode(true)}
+                  className={`p-2.5 rounded-xl text-left border transition-all ${
+                    strokeQuantizeMode
+                      ? "bg-amber-500/10 border-amber-500 text-amber-300"
+                      : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
+                  }`}
+                >
+                  <div className="text-xs font-bold">📐 クオンタイズ (全弦を同時刻に記録)</div>
+                  <div className="text-[10px] text-stone-400 font-normal">ストロークの全弦を1拍に揃えて記録。打ち込み向け。</div>
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex flex-wrap gap-2">
+                {ARPEGGIO_PRESETS.map((preset) => (
+                  <button
+                    key={preset.id}
+                    onClick={() => setArpeggioPattern(cloneArpeggioPattern(preset))}
+                    className={`px-3 py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
+                      arpeggioPattern.id === preset.id
+                        ? "bg-amber-500/10 border-amber-500 text-amber-300"
+                        : "border-stone-800 bg-stone-900 text-stone-300 hover:border-amber-500 hover:text-amber-300"
+                    }`}
+                  >
+                    {preset.name}
+                  </button>
+                ))}
+                <button
+                  onClick={() => setArpeggioPattern((prev) => resizeArpeggioGrid(prev, prev.steps === 16 ? 8 : 16))}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-bold border border-stone-700 bg-stone-800 text-stone-300 hover:border-amber-500 hover:text-amber-300 transition-all"
+                >
+                  グリッド: {arpeggioPattern.steps}ステップ（切替）
+                </button>
+              </div>
+
+              <div className="bg-stone-950 border border-stone-800 rounded-xl p-3 space-y-1 overflow-x-auto">
+                <div className="text-[10px] font-bold text-stone-500 mb-1">
+                  セルをクリックしてON/OFF。押さえているコードのボイシングから実際の音程を自動で発音します。
+                </div>
+                <div className="inline-block min-w-full">
+                  {[5, 4, 3, 2, 1, 0].map((stringIdx) => (
+                    <div key={stringIdx} className="flex items-center gap-1.5 mb-1">
+                      <span className="w-9 text-[10px] font-mono text-stone-400 shrink-0">{6 - stringIdx}弦</span>
+                      <div className="flex gap-1">
+                        {Array.from({ length: arpeggioPattern.steps }).map((_, stepIdx) => (
+                          <button
+                            key={stepIdx}
+                            onClick={() => toggleArpeggioCell(stringIdx, stepIdx)}
+                            className={`w-6 h-6 rounded border transition-all ${
+                              arpeggioPattern.grid[stringIdx][stepIdx]
+                                ? "bg-amber-500 border-amber-400"
+                                : "bg-stone-900 border-stone-800 hover:border-stone-600"
+                            }`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                <button
+                  onClick={() => setStrokeQuantizeMode(false)}
+                  className={`p-2.5 rounded-xl text-left border transition-all ${
+                    !strokeQuantizeMode
+                      ? "bg-amber-500/10 border-amber-500 text-amber-300"
+                      : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
+                  }`}
+                >
+                  <div className="text-xs font-bold">🎸 生演奏 (MIDIに時間差を記録)</div>
+                  <div className="text-[10px] text-stone-400 font-normal">指弾きのタイミングのズレをそのまま記録。</div>
+                </button>
+                <button
+                  onClick={() => setStrokeQuantizeMode(true)}
+                  className={`p-2.5 rounded-xl text-left border transition-all ${
+                    strokeQuantizeMode
+                      ? "bg-amber-500/10 border-amber-500 text-amber-300"
+                      : "bg-stone-900 border-stone-800 text-stone-400 hover:border-stone-700"
+                  }`}
+                >
+                  <div className="text-xs font-bold">📐 クオンタイズ (グリッドに揃えて記録)</div>
+                  <div className="text-[10px] text-stone-400 font-normal">打ち込み向け。</div>
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* STEP 2: コード進行 */}
-        <div className="space-y-2">
-          <label className="text-xs font-bold text-stone-400 tracking-wider">
-            STEP 2: コード進行を作成（4小節）
-          </label>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            {progression.map((chord, barIdx) => (
-              <div
-                key={barIdx}
-                className={`p-3 rounded-2xl border transition-all ${
-                  isPlaying && currentBar === barIdx
-                    ? "bg-stone-800 border-amber-400 shadow-md ring-1 ring-amber-400"
-                    : "bg-stone-900 border-stone-800"
-                }`}
-              >
-                <div className="text-[10px] font-mono text-stone-500 mb-1">小節 {barIdx + 1}</div>
-                <select
-                  value={chord}
-                  onChange={(e) => handleChordChange(barIdx, e.target.value)}
-                  className="w-full bg-stone-950 border border-stone-700 text-base font-bold py-2 px-2 rounded-xl text-amber-400 outline-none"
+        <div className="space-y-3">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <label className="text-xs font-bold text-stone-400 tracking-wider">
+              STEP 2: コード進行を作成（{progression.length}ブロック）
+            </label>
+          </div>
+
+          {/* カデンツ（終止形）理論エンジンによるランダム生成（長調のみ） */}
+          {keyMode === "major" && (
+            <div className="flex flex-wrap gap-2">
+              {CADENCE_MOOD_OPTIONS.map((mood) => (
+                <button
+                  key={mood.id}
+                  onClick={() => {
+                    const result = generateCadenceProgression(mood.id);
+                    setProgression(result.chords.map((chord, i) => createProgressionBlock(chord, result.beats[i])));
+                    setLastCadenceResult(result);
+                  }}
+                  className={`flex items-center gap-1.5 font-bold px-3 py-2 rounded-xl shadow-md transition-colors text-xs whitespace-nowrap ${
+                    mood.id === "auto"
+                      ? "bg-amber-500 hover:bg-amber-400 text-stone-950"
+                      : "border border-amber-500/40 bg-stone-900 text-amber-300 hover:bg-amber-500/10"
+                  }`}
                 >
-                  {DIATONIC_CHORDS.map((c) => (
-                    <option key={c.name} value={c.name}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ))}
+                  {mood.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* 短調カデンツ・パターン（マイナーキー時のみ） */}
+          {keyMode === "minor" && (
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => {
+                  const randomPattern = MINOR_CADENCE_PATTERNS[Math.floor(Math.random() * MINOR_CADENCE_PATTERNS.length)];
+                  const result = generateMinorCadenceProgression(randomPattern.id);
+                  setSelectedMinorPatternId(randomPattern.id);
+                  setProgression(result.chords.map((chord, i) => createProgressionBlock(chord, result.beats[i])));
+                  setLastCadenceResult(result);
+                }}
+                className="flex items-center gap-1.5 bg-amber-500 hover:bg-amber-400 text-stone-950 font-bold px-3 py-2 rounded-xl shadow-md transition-colors text-xs whitespace-nowrap"
+              >
+                🎲 おまかせ短調進行
+              </button>
+              {MINOR_CADENCE_PATTERNS.map((pattern) => (
+                <button
+                  key={pattern.id}
+                  onClick={() => {
+                    const result = generateMinorCadenceProgression(pattern.id);
+                    setSelectedMinorPatternId(pattern.id);
+                    setProgression(result.chords.map((chord, i) => createProgressionBlock(chord, result.beats[i])));
+                    setLastCadenceResult(result);
+                  }}
+                  className={`flex items-center gap-1.5 font-bold px-3 py-2 rounded-xl shadow-md transition-colors text-xs whitespace-nowrap border ${
+                    selectedMinorPatternId === pattern.id
+                      ? "bg-amber-500/20 border-amber-400 text-amber-200"
+                      : "border-amber-500/40 bg-stone-900 text-amber-300 hover:bg-amber-500/10"
+                  }`}
+                >
+                  {pattern.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* 直近に生成された進行の理論的な内訳バッジ */}
+          {lastCadenceResult && (
+            <div className="flex items-center gap-2 flex-wrap bg-amber-500/10 border border-amber-500/40 rounded-xl px-3 py-2 text-[11px] font-bold text-amber-300">
+              <Sparkles className="w-3.5 h-3.5 shrink-0" />
+              <span>
+                {lastCadenceResult.kind === "major"
+                  ? `適用されたカデンツ：${lastCadenceResult.skeletonLabel} [${lastCadenceResult.endingLabel}]`
+                  : `適用された進行：${lastCadenceResult.patternLabel}`}
+              </span>
+            </div>
+          )}
+
+          {/* 王道進行プリセット（固定パターン・長調のみ） */}
+          {keyMode === "major" && (
+            <div className="flex flex-wrap gap-2">
+              {PROGRESSION_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  onClick={() => {
+                    setProgression(preset.chords.map((chord) => createProgressionBlock(chord, 4)));
+                    setLastCadenceResult(null);
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-bold border border-stone-800 bg-stone-900 text-stone-300 hover:border-amber-500 hover:text-amber-300 transition-all"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* 和声リズム・タイムストレッチ（一括） */}
+          <div className="flex items-center gap-2 flex-wrap bg-stone-900/60 border border-stone-800 rounded-xl px-3 py-2">
+            <span className="text-[10px] font-bold text-stone-500 tracking-wider whitespace-nowrap">
+              和声リズム（一括）:
+            </span>
+            <button
+              onClick={() => setAllBeats(2)}
+              className="px-2.5 py-1 rounded-lg text-[11px] font-bold border border-stone-700 bg-stone-800 text-stone-300 hover:border-amber-500 hover:text-amber-300 transition-all"
+            >
+              ⏩ 一括倍速（各2拍 / 0.5倍）
+            </button>
+            <button
+              onClick={() => setAllBeats(4)}
+              className="px-2.5 py-1 rounded-lg text-[11px] font-bold border border-stone-700 bg-stone-800 text-stone-300 hover:border-amber-500 hover:text-amber-300 transition-all"
+            >
+              ▶ 一括標準（各4拍 / 1倍）
+            </button>
+            <button
+              onClick={() => setAllBeats(8)}
+              className="px-2.5 py-1 rounded-lg text-[11px] font-bold border border-stone-700 bg-stone-800 text-stone-300 hover:border-amber-500 hover:text-amber-300 transition-all"
+            >
+              ⏪ 一括倍長（各8拍 / 2倍）
+            </button>
+            <span className="text-[10px] text-stone-500 font-mono ml-auto">
+              合計 {progression.reduce((sum, b) => sum + b.beats, 0)}拍
+            </span>
+          </div>
+
+          <div className="flex flex-wrap gap-3">
+            {progression.map((block, barIdx) => {
+              const chordDef = activeChordLibrary.find((c) => c.name === block.chord);
+              const fn = chordDef?.function ?? (keyMode === "major" ? "T" : "Tm");
+              const style = FUNCTION_BADGE_STYLES[fn];
+              const bassRelation = smoothBassInfo[barIdx];
+
+              return (
+                <div
+                  key={block.id}
+                  style={{ flex: `${block.beats} 1 150px` }}
+                  className={`p-3 rounded-2xl border-2 transition-all ${
+                    isPlaying && currentBar === barIdx
+                      ? `bg-stone-800 ${style.border} shadow-md ring-1 ${style.ring}`
+                      : `bg-stone-900 ${style.border}`
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-mono text-stone-500">小節 {barIdx + 1}</span>
+                    <span className={`flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded border ${style.badge}`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
+                      {FUNCTION_SHORT_LABELS[fn]}
+                    </span>
+                  </div>
+
+                  <select
+                    value={block.chord}
+                    onChange={(e) => handleChordChange(barIdx, e.target.value)}
+                    className="w-full bg-stone-950 border border-stone-700 text-base font-bold py-2 px-2 rounded-xl text-amber-400 outline-none"
+                  >
+                    {activeFunctionGroups.map((f) => (
+                      <optgroup key={f} label={FUNCTION_LABELS[f]}>
+                        {getChordsByFunctionGroup(keyMode, f).map((c) => (
+                          <option key={c.name} value={c.name}>
+                            {c.name}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+
+                  <div className="h-4 mt-1">
+                    {bassRelation && (
+                      <div className="flex items-center gap-1 text-[10px] font-bold text-amber-300">
+                        <Sparkle className="w-3 h-3" />
+                        <span className="underline decoration-wavy decoration-amber-400 underline-offset-2">
+                          {bassRelation === "same" ? "🔁 ベース同音" : "✨ スムーズベース"}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 個別タイムストレッチ: このブロックの長さ（拍） */}
+                  <div className="flex items-center gap-1 mt-1">
+                    {([1, 2, 4, 8] as BlockBeats[]).map((b) => (
+                      <button
+                        key={b}
+                        onClick={() => handleBeatsChange(barIdx, b)}
+                        className={`flex-1 py-1 rounded-md text-[10px] font-bold border transition-all ${
+                          block.beats === b
+                            ? "bg-amber-500 border-amber-400 text-stone-950"
+                            : "bg-stone-950 border-stone-700 text-stone-500 hover:border-stone-500"
+                        }`}
+                      >
+                        {b}拍
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
 
         {/* STEP 3: メロディリズム */}
         <div className="space-y-3 bg-stone-900/60 border border-stone-800 p-4 rounded-2xl">
-          <label className="text-xs font-bold text-stone-400 tracking-wider">
-            STEP 3: メロディのリズムを選択 (またはランダム生成)
-          </label>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <label className="text-xs font-bold text-stone-400 tracking-wider">
+              STEP 3: メロディのリズムを選択 (またはランダム生成)
+            </label>
+            <button
+              onClick={() => setMelodyEnabled(!melodyEnabled)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-[11px] font-bold transition-all ${
+                melodyEnabled
+                  ? "bg-emerald-500/20 border-emerald-400 text-emerald-300"
+                  : "bg-stone-800 border-stone-600 text-stone-400"
+              }`}
+              title="コード進行の作成に集中したいときはメロディをオフにできます"
+            >
+              <span className={`w-8 h-4 rounded-full relative transition-colors ${melodyEnabled ? "bg-emerald-500" : "bg-stone-600"}`}>
+                <span
+                  className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${melodyEnabled ? "left-4" : "left-0.5"}`}
+                />
+              </span>
+              {melodyEnabled ? "メロディ ON" : "メロディ OFF（コードに集中）"}
+            </button>
+          </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+          <div className={`grid grid-cols-2 sm:grid-cols-5 gap-2 transition-opacity ${!melodyEnabled ? "opacity-40 pointer-events-none" : ""}`}>
             {melodyPatterns.map((mp) => (
               <button
                 key={mp.id}
                 onClick={() => setSelectedMelodyPatternId(mp.id)}
+                disabled={!melodyEnabled}
                 className={`p-2 rounded-xl text-center border text-xs font-bold transition-all ${
                   selectedMelodyPatternId === mp.id
                     ? "bg-emerald-500/20 border-emerald-400 text-emerald-300"
@@ -977,7 +2418,7 @@ export default function GuitarComposer() {
             ))}
           </div>
 
-          <div className="pt-2 border-t border-stone-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+          <div className={`pt-2 border-t border-stone-800 flex flex-col sm:flex-row items-center justify-between gap-3 transition-opacity ${!melodyEnabled ? "opacity-40 pointer-events-none" : ""}`}>
             <div className="flex-1 w-full">
               <div className="flex justify-between text-xs font-bold mb-1">
                 <span className="text-stone-400">ランダム音数・密度パラメータ</span>
@@ -990,12 +2431,14 @@ export default function GuitarComposer() {
                 step="5"
                 value={noteDensity}
                 onChange={(e) => setNoteDensity(parseInt(e.target.value, 10))}
+                disabled={!melodyEnabled}
                 className="w-full accent-emerald-500"
               />
             </div>
 
             <button
               onClick={generateRandomMelodyPattern}
+              disabled={!melodyEnabled}
               className="w-full sm:w-auto flex items-center justify-center gap-2 bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-bold px-5 py-2.5 rounded-xl shadow-md transition-colors text-xs whitespace-nowrap"
             >
               <Shuffle className="w-4 h-4" />
@@ -1130,12 +2573,30 @@ export default function GuitarComposer() {
 
         {/* 16ステップ可視化メーター */}
         <div className="bg-stone-900/60 border border-stone-800 p-4 rounded-2xl space-y-2">
-          <div className="text-xs font-bold text-stone-400">16ステップ演奏進行（ギター↓↑ / メロディ★）</div>
+          <div className="text-xs font-bold text-stone-400">
+            16ステップ演奏進行（{playMode === "stroke" ? "ギター↓↑✕" : "アルペジオ♪弦数"} / メロディ★）
+          </div>
           <div className="grid grid-cols-16 gap-1">
             {Array.from({ length: 16 }).map((_, i) => {
-              const strokeAction = STROKE_PATTERNS.find((p) => p.id === selectedPatternId)?.actions[i];
               const currentMelodyPattern = melodyPatterns.find((p) => p.id === selectedMelodyPatternId) || melodyPatterns[0];
               const isMelody = currentMelodyPattern?.mask[i];
+
+              let glyph = "・";
+              let glyphClass = "text-stone-500";
+              if (playMode === "stroke") {
+                const action = activeStrokeActions[i];
+                if (action?.dir === "down") { glyph = "↓"; glyphClass = "text-amber-300"; }
+                else if (action?.dir === "up") { glyph = "↑"; glyphClass = "text-emerald-300"; }
+                else if (action?.dir === "mute") { glyph = "✕"; glyphClass = "text-rose-300"; }
+              } else {
+                const window = 16 / arpeggioPattern.steps;
+                const isWindowStart = i % window === 0;
+                if (isWindowStart) {
+                  const arpIdx = Math.floor(i / window);
+                  const activeCount = arpeggioPattern.grid.reduce((sum, row) => sum + (row[arpIdx] ? 1 : 0), 0);
+                  if (activeCount > 0) { glyph = `♪${activeCount}`; glyphClass = "text-amber-300"; }
+                }
+              }
 
               return (
                 <div
@@ -1146,9 +2607,7 @@ export default function GuitarComposer() {
                       : "bg-stone-900 border border-stone-800"
                   }`}
                 >
-                  <span className={strokeAction?.dir === "down" ? "text-amber-300" : "text-emerald-300"}>
-                    {strokeAction?.dir === "down" ? "↓" : strokeAction?.dir === "up" ? "↑" : "・"}
-                  </span>
+                  <span className={glyphClass}>{glyph}</span>
                   <span className="text-[8px] font-bold text-rose-400">{isMelody ? "★" : ""}</span>
                 </div>
               );
